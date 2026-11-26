@@ -148,8 +148,8 @@ few signatures changed; the changelog's Breaking (Rust API) section lists each
 one.
 
 **Pinning.** Behaviour moves inside 1.x, because conformance fixes ship as
-minors. [versioning.md](versioning.md) explains the trade and how to pin
-narrower if you would rather it held still.
+patches (as minors up to 1.8.0). [versioning.md](versioning.md) explains the
+trade and how to pin an exact version if you would rather it held still.
 
 ## Upgrading to 0.12.x
 
@@ -207,9 +207,10 @@ docker run --rm -p 8000:8000 \
   serve --host 0.0.0.0 --port 8000 --db-path /data/dynoxide.sqlite
 ```
 
-Image tags follow the version: `dynoxide:1.8.0` is exact, `dynoxide:1.8` floats
-across patches, and `dynoxide:1` floats across the whole 1.x line. `:1` receives
-conformance fixes, which change behaviour within a major; `:1.2` does not. See
+Image tags follow the version: `dynoxide:1.8.1` is exact, `dynoxide:1.8` floats
+across patches, and `dynoxide:1` floats across the whole 1.x line. Both floating
+tags receive conformance fixes, which change behaviour within a major and, from
+1.8.1, ship as patches. Pin the exact tag to hold behaviour still. See
 `docs/versioning.md`.
 
 The image runs as root by default, matching `amazon/dynamodb-local`, so bind mounts on Linux work without `--user`. The canonical image lives at `ghcr.io/nubo-db/dynoxide`. Mirrors are pushed to `docker.io/nubodb/dynoxide` and `public.ecr.aws/nubo-db/dynoxide` on a best-effort basis. SLSA provenance and SBOM attestations are published to GHCR only, so pull from GHCR if you want to verify provenance.

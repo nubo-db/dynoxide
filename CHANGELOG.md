@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- **Conformance fixes now ship as patch releases.** A fix that brings an
+  answer closer to DynamoDB's, backed by a recorded AWS observation, used to
+  take a minor. From 1.8.1 it takes a patch, so a minor pin such as `~1.8.0`
+  or `dynoxide:1.8` no longer holds behaviour still. Pin an exact version to
+  do that. [versioning.md](docs/versioning.md) has the details for each
+  package manager.
+- **DescribeStream returns a `ShardId` in DynamoDB's shape.** It's now
+  `shardId-`, 20 digits, `-` and 8 hex digits, 37 characters whatever the
+  table's name. It used to be `shardId-00000001-` followed by the table name,
+  which boto3 and the PHP SDK refuse before sending GetShardIterator when the
+  name is under 11 characters, and which ran past the 65 characters DynamoDB's
+  API allows when the name was over 48. A stream keeps its ID across restarts,
+  and a new stream on the same table, after disabling and re-enabling it or
+  recreating the table, gets a new one. GetShardIterator still accepts the old
+  form, and shard iterators from earlier releases still read, so a consumer
+  that kept either keeps working. Database files need no upgrade.
+  ([#361](https://github.com/nubo-db/dynoxide/issues/361))
+
 ### Added
 
 - **A Python package.** `pip install dynoxide` installs Dynoxide with a
@@ -2866,7 +2886,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/nubo-db/dynoxide/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0

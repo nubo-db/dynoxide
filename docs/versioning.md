@@ -60,7 +60,7 @@ additive and ships as a minor; changing or removing one is not.
 | Ready line field removed, renamed or changed in meaning | Product | major |
 | Ready line field added | Product | minor |
 | Engine behaviour change | Both | major, unless it is a capture-backed conformance fix |
-| Conformance fix, capture-backed | Both | minor |
+| Conformance fix, capture-backed | Both | patch |
 | New DynamoDB operation | Both | minor |
 | New feature flag | Crate | minor |
 | Feature flag turns on less, with no public item lost | Crate | minor |
@@ -173,42 +173,50 @@ fixing it changes how the engine answers. Under the rule above every such fix
 would be a major, and a project correcting its own divergences would reach
 8.0.0 inside a year, stranding a cohort of users at each one.
 
-So conformance fixes ship as **minors**, on one condition: there must be a
+So conformance fixes ship as **patches**, on one condition: there must be a
 recorded observation of the AWS behaviour being matched, such as a capture
 naming region, date and request, a conformance suite result, or an equivalent
 artefact. With no recorded observation there's no exception, and the change
 takes a major.
 
+A conformance fix is a bug fix, so it takes the bug-fix number. This applies
+from 1.8.1. Up to 1.8.0 conformance fixes shipped as minors, so release notes
+from then say a minor pin held behaviour still; from 1.8.1 it doesn't.
+
 The condition matters. Without it, "this matches AWS more closely" is just a
 claim Dynoxide makes about its own change, and any behaviour change at all could
 be filed under it.
 
-Occasionally a conformance fix is disruptive enough that shipping it as a minor
-is indefensible, and it takes a major instead. When that happens the release
-note names the consumer behaviour that could not be carried across, and why
+Occasionally a conformance fix is disruptive enough that shipping it as a patch
+is indefensible, and it takes a minor or a major instead. When that happens the
+release note names the consumer behaviour that could not be carried across, and why
 listing it as a behaviour change was not enough.
 
 ## What `^1.0.0` gives you, and what it does not
 
 `^1.0.0` accepts every 1.x release. It does not freeze behaviour.
 
-Behaviour moves inside 1.x, because conformance fixes ship as minors. A test
-passing against 1.2.0 can fail against 1.3.0 if 1.3.0 corrected a divergence
-that test had come to depend on. That is the deliberate trade of this policy:
+Behaviour moves inside 1.x, even between patches, because conformance fixes
+ship as patches. A test passing against 1.8.1 can fail against 1.8.2 if 1.8.2
+corrected a divergence that test had come to depend on. That is the deliberate
+trade of this policy:
 for an emulator, an answer closer to DynamoDB is usually the one you wanted, and
 the alternative is a new major every few weeks.
 
 If you would rather behaviour held still:
 
-- **npm:** `~1.2.0` accepts patches only.
-- **pip:** `dynoxide~=1.2.0` accepts patches and post-releases only.
-- **Containers:** `dynoxide:1.2` is pinned to the minor. `dynoxide:1` floats
-  across the whole major line and does receive conformance fixes.
-- **Cargo:** `=2.0.0`, or rely on your lockfile. That pins the crate, which is
+- **npm:** an exact version, `1.8.1`, which
+  `npm install dynoxide@1.8.1 --save-exact` writes.
+- **pip:** `dynoxide==1.8.1.*` accepts that release and its post-releases, which
+  change only the Python package, never the engine.
+- **Containers:** `dynoxide:1.8.1` is exact. `dynoxide:1.8` floats across
+  patches and `dynoxide:1` across the whole major line, and both receive
+  conformance fixes.
+- **Cargo:** `=4.1.0`, or rely on your lockfile. That pins the crate, which is
   a different number from the product version the binary reports.
 
-`npm install dynoxide` writes a caret range for you. If you want the narrower
-range, ask for it explicitly.
+`npm install dynoxide` writes a caret range for you. If you want an exact
+version, ask for it with `--save-exact`.
 
 ## Reading the two numbers
 

@@ -26,6 +26,14 @@ Conformance fixes ship as patch releases (minor releases up to 1.8.0), so behavi
     earlier stream's, which used to read nothing;
   - UpdateTable enabling a stream that is already enabled, which used to start
     a new stream.
+- **Some names are refused before anything is written**, where DynamoDB
+  accepts them. CreateTable now refuses a table name that differs only in case
+  from an existing table's, matches one of Dynoxide's own tables (`_tables`,
+  `_config`, `_stream_records`) in any case, or starts `sqlite_`, with
+  `ResourceInUseException`. It used to fail with `InternalServerError` after
+  listing the table. A second index of the same kind whose name differs only in
+  case is refused with `ValidationException`; adding a vector index that way
+  through UpdateTable used to succeed and delete the first index's data.
 
 ### 1.6.0
 
@@ -479,6 +487,7 @@ DynamoDB Local fails a share of the suite that real DynamoDB passes, clustered i
 - **Number arithmetic precision** - uses `rust_decimal` for arbitrary-precision arithmetic, which may have minor differences from DynamoDB's proprietary implementation at extreme edge cases
 - **Transaction contention errors** - `TransactionConflictException` and `TransactionInProgressException` not emulated (concurrent transaction contention doesn't apply to single-process emulator)
 - **Which of two PartiQL refusals is reported** - when one statement holds both an operand of the wrong type for its operator (such as `size(s) < true`) and something refused as the statement is read, Dynoxide reports the second and DynamoDB reports the operand's type
+- **Table and index names that differ only in case** - Dynoxide stores each table and index in an SQLite table named after it, and SQLite compares those names ignoring case. So CreateTable refuses a table name that differs only in case from an existing table's, matches one of Dynoxide's own tables in any case, or starts `sqlite_`, and CreateTable and UpdateTable refuse a second index of the same kind whose name differs only in case. DynamoDB accepts all of these ([#366](https://github.com/nubo-db/dynoxide/issues/366))
 - **Map order in a refused request's echo** - when a request too long to accept is echoed back in its error (`BatchWriteItem` over 25 requests, a transaction over 100 actions), each map lists its entries in the order of the Java hash map DynamoDB reads it into, sized to the map. Two entries that land in the same bucket are listed in the order they were sent on DynamoDB, and in name order on Dynoxide, because Dynoxide no longer has the sending order once the request is read
 
 ### Where AWS answers the same request differently

@@ -5,7 +5,7 @@ changes as things ship and as people ask for things, so treat it as direction
 rather than dates. If something here matters to you, or something missing
 does, say so in an [issue](https://github.com/nubo-db/dynoxide/issues).
 
-## Now: 1.8.0
+## Shipped in 1.8.0
 
 A fixed port for dev setups, where something needs the endpoint before the
 server starts: a second app, an `.env` file or NoSQL Workbench.
@@ -16,6 +16,8 @@ server starts: a second app, an `.env` file or NoSQL Workbench.
   was given is in use, and both packages turn that into an error naming the
   port, without reading stderr.
 - **Laravel's `dynoxide:serve`** names a taken port and how to change it.
+- **A Python launcher** on PyPI, built on the same contract:
+  `dynoxide.start()`, pytest fixtures, and the binary inside the wheel.
 
 ## Shipped in 1.7.0
 
@@ -26,9 +28,6 @@ the `nubo-db/dynoxide-laravel` package.
 
 ## Next
 
-- **A Python launcher** on PyPI, built on the same contract: `dynoxide.start()`,
-  pytest fixtures, and the binary inside the wheel. The package is in
-  [`python/`](python/), and its first release carries 1.8.0.
 - **Guides for Symfony and Bref**, and for Architect's sandbox.
 - **Closing the remaining differences from DynamoDB.** The open
   [bug issues](https://github.com/nubo-db/dynoxide/issues?q=is%3Aopen+label%3Abug)

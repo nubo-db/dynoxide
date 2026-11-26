@@ -396,6 +396,7 @@ pub trait StorageBackend: private::Sealed {
     /// Whether a new table can't be stored under `table_name`: SQLite holds a
     /// table of that name ignoring case, the name starts `sqlite_`, or a table
     /// is listed under it in another case.
+    #[doc(hidden)]
     async fn table_name_taken(&self, table_name: &str) -> Result<bool, BackendError>;
 
     // -----------------------------------------------------------------------

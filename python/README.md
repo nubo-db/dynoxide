@@ -111,6 +111,6 @@ The `dynoxide` command runs the bundled binary, so `dynoxide serve --port 8000` 
 
 Dynoxide is for tests and local development. It binds to loopback, accepts any credentials and doesn't check request signatures.
 
-The package's version matches the engine's: `dynoxide 1.8.0` on PyPI carries Dynoxide 1.8.0. A fix to the Python package alone ships as a post-release, such as `1.8.0.post1`.
+The package's version matches the engine's: `dynoxide 1.8.1` on PyPI carries Dynoxide 1.8.1. A fix to the Python package alone ships as a post-release, such as `1.8.1.post1`.
 
 Dual licensed under MIT or Apache-2.0.

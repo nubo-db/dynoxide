@@ -182,7 +182,7 @@ became `#[non_exhaustive]`:
 ## GitHub Actions
 
 ```yaml
-- uses: nubo-db/dynoxide/action@v1.8.0
+- uses: nubo-db/dynoxide/action@v1.8.1
   with:
     snapshot-url: https://example.com/test-data.db.zst  # optional
     port: 8000

@@ -66,14 +66,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drops only tables that belong to the table being deleted. If an earlier
   release listed a table after refusing to create it, delete it: that is now
   safe and leaves the other table alone. DynamoDB accepts these names, and
-  Dynoxide still refuses them.
+  Dynoxide still refuses them
+  ([#366](https://github.com/nubo-db/dynoxide/issues/366)).
+  ([#365](https://github.com/nubo-db/dynoxide/issues/365))
 - **Two indexes of the same kind whose names differ only in case are
   refused.** Each index is stored in an SQLite table named after it, so
   `byG` and `BYG` would share one. CreateTable and UpdateTable now refuse the
   second with `ValidationException` and the duplicate-index message. Adding a
   vector index this way through UpdateTable used to succeed and delete the
   first index's data; adding a GSI failed with `InternalServerError`.
-  DynamoDB accepts these names.
+  DynamoDB accepts these names
+  ([#366](https://github.com/nubo-db/dynoxide/issues/366)).
+  ([#365](https://github.com/nubo-db/dynoxide/issues/365))
 - **Scaffolding from a schema file reports a table it can't create**, such as
   `users` beside `Users`, instead of skipping it as one that already exists.
 

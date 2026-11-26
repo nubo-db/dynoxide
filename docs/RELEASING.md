@@ -60,6 +60,15 @@ maintainer's approval. `python.yml` runs as its own workflow, so a release
 asks twice: once at the release's gate, and again when its PyPI publish is
 ready.
 
+The PHP packages are released from their own repositories once the engine
+release has finished publishing.
+[`nubo-db/dynoxide-php`](https://github.com/nubo-db/dynoxide-php), the
+Composer package `nubo-db/dynoxide`, is versioned in step with the engine and
+carries each release's checksums, so every engine release gets one.
+[`nubo-db/dynoxide-laravel`](https://github.com/nubo-db/dynoxide-laravel) has
+its own version and needs a release only when its own code or its core
+requirement changes. Each repository's `RELEASING.md` has the steps.
+
 ## Verifying a release
 
 - **sha256sums.txt** is attached to every GitHub Release. Download it

@@ -33,7 +33,7 @@ aws dynamodbstreams list-streams --endpoint-url http://localhost:8000
 # Describe a stream to get shard IDs
 aws dynamodbstreams describe-stream \
   --endpoint-url http://localhost:8000 \
-  --stream-arn arn:aws:dynamodb:local:000000000000:table/Events/stream/...
+  --stream-arn arn:aws:dynamodb:dynoxide:000000000000:table/Events/stream/...
 
 # Get a shard iterator and read records
 aws dynamodbstreams get-shard-iterator \
@@ -42,6 +42,11 @@ aws dynamodbstreams get-shard-iterator \
   --shard-id <shard-id> \
   --shard-iterator-type TRIM_HORIZON
 ```
+
+Each stream has one shard. Its ID has DynamoDB's shape, such as
+`shardId-00000001795697354493-ebb9c0b7`, and stays the same for the life of the
+stream. Releases before 1.8.1 returned `shardId-00000001-` followed by the table
+name, and GetShardIterator still accepts that form.
 
 ## Streams with import
 

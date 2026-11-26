@@ -1,5 +1,6 @@
 use dynoxide::Database;
 use dynoxide::actions::create_table::{CreateTableRequest, StreamSpecification};
+use dynoxide::actions::describe_stream::DescribeStreamRequest;
 use dynoxide::actions::describe_time_to_live::DescribeTimeToLiveRequest;
 use dynoxide::actions::get_records::GetRecordsRequest;
 use dynoxide::actions::get_shard_iterator::GetShardIteratorRequest;
@@ -293,7 +294,7 @@ fn test_ttl_deletion_generates_stream_remove_record() {
     let iter_resp = db
         .get_shard_iterator(GetShardIteratorRequest {
             stream_arn: stream_arn.clone(),
-            shard_id: "shardId-00000001-TestTable".to_string(),
+            shard_id: shard_id(&db, stream_arn.clone()),
             shard_iterator_type: "TRIM_HORIZON".to_string(),
             sequence_number: None,
         })
@@ -652,8 +653,8 @@ fn test_sweep_across_pages_records_one_stream_remove_per_item() {
         .clone();
     let iterator = db
         .get_shard_iterator(GetShardIteratorRequest {
+            shard_id: shard_id(&db, stream_arn.clone()),
             stream_arn,
-            shard_id: "shardId-00000001-TestTable".to_string(),
             shard_iterator_type: "TRIM_HORIZON".to_string(),
             sequence_number: None,
         })
@@ -700,4 +701,13 @@ fn test_update_ttl_empty_attribute_name_rejected() {
         "Expected attributeName validation error, got: {}",
         err_str
     );
+}
+
+/// The shard ID DescribeStream returns for a stream.
+fn shard_id(db: &Database, stream_arn: String) -> String {
+    let req: DescribeStreamRequest =
+        serde_json::from_value(serde_json::json!({"StreamArn": stream_arn})).unwrap();
+    db.describe_stream(req).unwrap().stream_description.shards[0]
+        .shard_id
+        .clone()
 }

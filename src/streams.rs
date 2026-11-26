@@ -39,9 +39,51 @@ pub fn kms_key_arn(key_id: &str) -> String {
     }
 }
 
-/// Shard ID for a table (one shard per table in simplified model).
+/// The shard ID a table's stream records are stored under (one shard per
+/// table in the simplified model).
+///
+/// This is the stored form, which shard iterators carry. It is not the
+/// `ShardId` that DescribeStream returns: see [`public_shard_id`].
 pub fn shard_id(table_name: &str) -> String {
     format!("shardId-00000001-{table_name}")
+}
+
+/// The `ShardId` DescribeStream returns for a table's stream: `shardId-`, 20
+/// digits, `-` and 8 hex digits, 37 characters whatever the table name, the
+/// shape DynamoDB uses and within the 28 to 65 characters its API model allows.
+///
+/// The digits are the stream's creation time in milliseconds, read from its
+/// label, and the hex comes from the table name and label, so a stream keeps
+/// its ID and a new stream on the same table gets a new one. A stream with no
+/// label gets zeros and a hash of the table name alone.
+pub(crate) fn public_shard_id(table_name: &str, label: Option<&str>) -> String {
+    let label = label.unwrap_or_default();
+    let millis = label
+        .split_once('.')
+        .and_then(|(secs, nanos)| {
+            let secs: u64 = secs.parse().ok()?;
+            let nanos: u64 = nanos.parse().ok()?;
+            secs.checked_mul(1000)?.checked_add(nanos / 1_000_000)
+        })
+        .unwrap_or(0);
+    let digest = if label.is_empty() {
+        md5::compute(table_name.as_bytes())
+    } else {
+        md5::compute([table_name.as_bytes(), b"\0", label.as_bytes()].concat())
+    };
+    let hex = format!("{digest:x}");
+    format!("shardId-{millis:020}-{}", &hex[..8])
+}
+
+/// The stored shard ID a GetShardIterator `ShardId` refers to. The stream's
+/// public ID maps to the stored form. Anything else, such as the stored form
+/// itself, which earlier releases returned, passes through unchanged.
+pub(crate) fn requested_shard_id(table_name: &str, label: Option<&str>, requested: &str) -> String {
+    if requested == public_shard_id(table_name, label) {
+        shard_id(table_name)
+    } else {
+        requested.to_string()
+    }
 }
 
 /// Offset that turns a stored sequence number into its 21-digit public form.

@@ -20,7 +20,9 @@ pub struct GetShardIteratorResponse {
     pub shard_iterator: Option<String>,
 }
 
-/// Shard iterator is a base64-encoded JSON of `{table_name, shard_id, position}`.
+/// Shard iterator is a base64-encoded JSON of `{table_name, shard_id, position}`,
+/// where `shard_id` is the stored form from `streams::shard_id`, not the
+/// `ShardId` DescribeStream returns.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ShardIteratorData {
     table_name: String,
@@ -79,6 +81,12 @@ pub async fn execute<S: StorageBackend>(
         )));
     }
 
+    let shard_id = crate::streams::requested_shard_id(
+        &table_name,
+        meta.stream_label.as_deref(),
+        &request.shard_id,
+    );
+
     let kind = request.shard_iterator_type.as_str();
     if matches!(kind, "TRIM_HORIZON" | "LATEST") && request.sequence_number.is_some() {
         return Err(DynoxideError::ValidationException(
@@ -92,7 +100,7 @@ pub async fn execute<S: StorageBackend>(
         "LATEST" => {
             // Position at the shard's last record, so only later ones return.
             let (_, last) = storage
-                .get_shard_sequence_range(&table_name, &request.shard_id)
+                .get_shard_sequence_range(&table_name, &shard_id)
                 .await?;
             last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
         }
@@ -106,7 +114,7 @@ pub async fn execute<S: StorageBackend>(
         }
     };
 
-    let iterator = encode_shard_iterator(&table_name, &request.shard_id, position);
+    let iterator = encode_shard_iterator(&table_name, &shard_id, position);
 
     Ok(GetShardIteratorResponse {
         shard_iterator: Some(iterator),

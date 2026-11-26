@@ -43,7 +43,8 @@ pub fn kms_key_arn(key_id: &str) -> String {
 /// table in the simplified model).
 ///
 /// This is the stored form, which shard iterators carry. It is not the
-/// `ShardId` that DescribeStream returns: see [`public_shard_id`].
+/// `ShardId` that DescribeStream returns, which is derived from the stream's
+/// label.
 pub fn shard_id(table_name: &str) -> String {
     format!("shardId-00000001-{table_name}")
 }

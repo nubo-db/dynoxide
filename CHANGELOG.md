@@ -25,8 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over 48. A stream keeps its ID across restarts, and a new stream on the same
   table, after disabling and re-enabling it or recreating the table, gets a
   new one. GetShardIterator still accepts the old form, and shard iterators
-  from earlier releases still read, so a consumer that kept either keeps
-  working. Database files need no upgrade.
+  from earlier releases still read, so a consumer that kept either can still
+  read the stream. A consumer that tracks shards by ID, such as one built on
+  the Kinesis Client Library, sees the stream's shard change once on upgrade,
+  and reads it from where its settings start a new shard. Database files need
+  no upgrade.
   ([#361](https://github.com/nubo-db/dynoxide/issues/361))
 - **GetShardIterator refuses a `ShardId` the stream doesn't have** with
   `ResourceNotFoundException` and `Requested resource not found: Shard does

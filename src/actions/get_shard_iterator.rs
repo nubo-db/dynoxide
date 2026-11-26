@@ -89,6 +89,22 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
+    // Validate the request before looking up its shard, so a malformed request
+    // gets the same answer whether or not the shard exists. `None` is LATEST,
+    // whose position needs the shard.
+    let requested_position = match kind {
+        "TRIM_HORIZON" => Some(0),
+        "LATEST" => None,
+        // AT includes the named record, so position just before it.
+        "AT_SEQUENCE_NUMBER" => Some(requested_sequence_number(&request)? - 1),
+        "AFTER_SEQUENCE_NUMBER" => Some(requested_sequence_number(&request)?),
+        other => {
+            return Err(DynoxideError::ValidationException(format!(
+                "Invalid ShardIteratorType: {other}"
+            )));
+        }
+    };
+
     // A ShardId the stream doesn't answer to is refused as DynamoDB refuses it
     // (eu-west-2, 26 November 2026). Records an import wrote before 1.5.0, in
     // the form `shardId-{table}-000000`, are still reachable by that ID.
@@ -111,22 +127,15 @@ pub async fn execute<S: StorageBackend>(
         }
     };
 
-    let position = match kind {
-        "TRIM_HORIZON" => 0,
-        "LATEST" => {
-            // Position at the shard's last record, so only later ones return.
+    let position = match requested_position {
+        Some(position) => position,
+        None => {
+            // LATEST: position at the shard's last record, so only later ones
+            // return.
             let (_, last) = storage
                 .get_shard_sequence_range(&table_name, &shard_id)
                 .await?;
             last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
-        }
-        // AT includes the named record, so position just before it.
-        "AT_SEQUENCE_NUMBER" => requested_sequence_number(&request)? - 1,
-        "AFTER_SEQUENCE_NUMBER" => requested_sequence_number(&request)?,
-        other => {
-            return Err(DynoxideError::ValidationException(format!(
-                "Invalid ShardIteratorType: {other}"
-            )));
         }
     };
 

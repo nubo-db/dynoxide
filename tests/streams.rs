@@ -1136,6 +1136,35 @@ fn a_shard_id_the_stream_never_had_is_refused() {
 }
 
 #[test]
+fn an_invalid_request_is_refused_before_its_shard_id_is_looked_up() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let known = described_shard_id(&db, "Evt");
+    let error = |shard_id: &str, kind: &str| {
+        let req = json!({
+            "StreamArn": get_stream_arn(&db, "Evt"),
+            "ShardId": shard_id,
+            "ShardIteratorType": kind
+        });
+        format!(
+            "{:?}",
+            db.get_shard_iterator(serde_json::from_value(req).unwrap())
+                .unwrap_err()
+        )
+    };
+    // The answer for a bad request doesn't depend on whether the shard exists.
+    for kind in ["BOGUS", "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"] {
+        let with_known = error(&known, kind);
+        assert!(with_known.contains("ValidationException"), "{with_known}");
+        assert_eq!(
+            error("shardId-00000000000000000000-00000000", kind),
+            with_known,
+            "{kind}"
+        );
+    }
+}
+
+#[test]
 fn a_shard_id_from_an_earlier_stream_is_refused() {
     let db = Database::memory().unwrap();
     create_stream_table(&db, "Evt", "NEW_IMAGE");

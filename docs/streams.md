@@ -51,7 +51,10 @@ name, and GetShardIterator still accepts that form. Any other ID is refused with
 
 To change a stream's view type, disable the stream and enable it again. Enabling
 a stream that is already enabled fails with `ValidationException`, as it does on
-DynamoDB, and the new stream has a new ARN and shard ID.
+DynamoDB, and the new stream has a new ARN and shard ID. Unlike on DynamoDB, the
+new stream also returns the records the earlier one held, and so does a stream
+on a table recreated with the same name
+([#363](https://github.com/nubo-db/dynoxide/issues/363)).
 
 ## Streams with import
 

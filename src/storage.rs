@@ -752,7 +752,7 @@ impl Storage {
         table_exists(&self.conn, table_name)
     }
 
-    /// Whether SQLite would refuse a data table named `table_name` (see
+    /// Whether a new table can't be stored under `table_name` (see
     /// `StorageBackend::table_name_taken`).
     pub(crate) fn table_name_taken(&self, table_name: &str) -> Result<bool> {
         Ok(self

@@ -387,13 +387,15 @@ pub trait StorageBackend: private::Sealed {
 
     async fn table_exists(&self, table_name: &str) -> Result<bool, BackendError>;
 
-    /// Whether the data table of a listed table is there. CreateTable lists a
-    /// table before it makes its data table, and DeleteTable drops the data
-    /// table before it unlists it, so a listed table can lack one.
+    /// Whether SQLite holds a table under exactly this name, compared with
+    /// case: a listed table's data table, or one of its index tables
+    /// (`<table>::gsi::<index>` and the like). A file an earlier release
+    /// damaged can list a table that lacks either.
     async fn data_table_exists(&self, table_name: &str) -> Result<bool, BackendError>;
 
-    /// Whether SQLite would refuse a data table named `table_name`: one exists
-    /// under that name ignoring case, or the name starts `sqlite_`.
+    /// Whether a new table can't be stored under `table_name`: SQLite holds a
+    /// table of that name ignoring case, the name starts `sqlite_`, or a table
+    /// is listed under it in another case.
     async fn table_name_taken(&self, table_name: &str) -> Result<bool, BackendError>;
 
     // -----------------------------------------------------------------------

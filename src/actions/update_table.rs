@@ -1416,7 +1416,9 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
             }
         }
 
-        // Check repeated index names
+        // Check repeated index names, ignoring case: each index is stored in
+        // an SQLite table named after it, and SQLite compares table names
+        // ignoring case, so creating `byG` and `BYG` together would make one.
         let mut seen_names = std::collections::HashSet::new();
         for update in updates {
             let name = if let Some(ref u) = update.update {
@@ -1427,7 +1429,7 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
                 update.delete.as_ref().map(|d| d.index_name.as_str())
             };
             if let Some(name) = name
-                && !seen_names.insert(name.to_string())
+                && !seen_names.insert(name.to_ascii_lowercase())
             {
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values were invalid: Only one global secondary index update per index is allowed simultaneously. Index: {}",

@@ -451,3 +451,95 @@ fn adding_a_vector_index_whose_name_differs_only_in_case_keeps_the_other() {
     drop(db);
     assert_eq!(sqlite_tables(&path, "Vec::"), ["Vec::vector::cos"]);
 }
+
+#[test]
+fn a_table_whose_data_table_an_earlier_release_dropped_can_be_deleted_and_recreated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("orphaned-index.db");
+    {
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        create_with_gsi(&db, "Users");
+    }
+    // What deleting a half-created `users` did before: SQLite resolved its
+    // DROP TABLE to `Users`, so `Users` lost its data table but kept its GSI
+    // table and its listing.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE \"Users\"")
+        .unwrap();
+
+    let db = Database::new(path.to_str().unwrap()).unwrap();
+    delete(&db, "Users").unwrap();
+    assert!(tables(&db).is_empty());
+    drop(db);
+    assert!(sqlite_tables(&path, "Users").is_empty());
+
+    let db = Database::new(path.to_str().unwrap()).unwrap();
+    create_with_gsi(&db, "Users");
+    put(
+        &db,
+        "Users",
+        json!({"pk": {"S": "k"}, "g": {"S": "x"}, "v": {"S": "new"}}),
+    );
+    assert_eq!(query_g(&db, "Users"), 1);
+}
+
+#[test]
+fn a_name_listed_under_another_case_is_refused_until_that_listing_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ghost-then-recreate.db");
+    {
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+        create(&db, "Users").unwrap();
+    }
+    leave_half_created(&path, "Users", "users");
+
+    let db = Database::new(path.to_str().unwrap()).unwrap();
+    delete(&db, "Users").unwrap();
+    assert_eq!(tables(&db), ["users"]);
+
+    // A new `Users` would be read and written through the `users` listing.
+    let error = create(&db, "Users").unwrap_err();
+    assert!(error.contains("ResourceInUseException"), "{error}");
+
+    delete(&db, "users").unwrap();
+    create(&db, "Users").unwrap();
+    put(&db, "Users", json!({"pk": {"S": "k"}, "v": {"S": "new"}}));
+    assert_eq!(get_v(&db, "Users").unwrap().as_deref(), Some("new"));
+    assert!(
+        format!("{:?}", get_v(&db, "users").unwrap_err()).contains("ResourceNotFoundException")
+    );
+}
+
+#[test]
+fn two_gsi_creates_in_one_call_whose_names_differ_only_in_case_are_refused() {
+    let db = Database::memory().unwrap();
+    create(&db, "Users").unwrap();
+    let gsi = |name: &str| {
+        json!({"Create": {
+            "IndexName": name,
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        }})
+    };
+    let error = update(
+        &db,
+        json!({
+            "TableName": "Users",
+            "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
+            "GlobalSecondaryIndexUpdates": [gsi("byG"), gsi("BYG")]
+        }),
+    )
+    .unwrap_err();
+    assert!(error.contains("ValidationException"), "{error}");
+    assert!(
+        error.contains(
+            "Only one global secondary index update per index is allowed simultaneously. Index: BYG"
+        ),
+        "{error}"
+    );
+    let described = db
+        .describe_table(serde_json::from_value(json!({"TableName": "Users"})).unwrap())
+        .unwrap();
+    assert!(described.table.global_secondary_indexes.is_none());
+}

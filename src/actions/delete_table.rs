@@ -114,43 +114,57 @@ pub async fn execute<S: StorageBackend>(
     // Drop only tables this table owns. SQLite resolves a table name ignoring
     // case, so a table an earlier release left half-created (listed, but its
     // CREATE TABLE refused because `Users` or one of Dynoxide's own tables
-    // already had the name) would otherwise drop that other table. Such a
-    // table has no data table under exactly its name, and no DynamoDB table is
-    // stored under a reserved name, so for it only the listing goes.
-    let owns_tables = storage.data_table_exists(&request.table_name).await?
-        && !crate::storage_backend::sql_builders::is_reserved_table_name(&request.table_name);
-    if owns_tables {
-        // Drop GSI tables first
-        if let Some(ref gsi_json) = meta.gsi_definitions
-            && let Ok(gsis) = serde_json::from_str::<Vec<GlobalSecondaryIndex>>(gsi_json)
-        {
-            for gsi in &gsis {
+    // already had the name) would otherwise drop that other table. A table
+    // owns a SQLite table only when one exists under exactly the name it
+    // would use, and never one under a reserved name. Each is asked on its
+    // own: a table whose data table an earlier release dropped can still own
+    // its index tables, and they must go so the table can be created again.
+    let reserved =
+        crate::storage_backend::sql_builders::is_reserved_table_name(&request.table_name);
+    let owns = |sqlite_name: String| async move {
+        Ok::<bool, DynoxideError>(!reserved && storage.data_table_exists(&sqlite_name).await?)
+    };
+
+    if let Some(ref gsi_json) = meta.gsi_definitions
+        && let Ok(gsis) = serde_json::from_str::<Vec<GlobalSecondaryIndex>>(gsi_json)
+    {
+        for gsi in &gsis {
+            if owns(format!("{}::gsi::{}", request.table_name, gsi.index_name)).await? {
                 storage
                     .drop_gsi_table(&request.table_name, &gsi.index_name)
                     .await?;
             }
         }
+    }
 
-        // Drop LSI tables
-        if let Some(ref lsi_json) = meta.lsi_definitions
-            && let Ok(lsis) = serde_json::from_str::<Vec<LocalSecondaryIndex>>(lsi_json)
-        {
-            for lsi in &lsis {
+    if let Some(ref lsi_json) = meta.lsi_definitions
+        && let Ok(lsis) = serde_json::from_str::<Vec<LocalSecondaryIndex>>(lsi_json)
+    {
+        for lsi in &lsis {
+            if owns(format!("{}::lsi::{}", request.table_name, lsi.index_name)).await? {
                 storage
                     .drop_lsi_table(&request.table_name, &lsi.index_name)
                     .await?;
             }
         }
+    }
 
-        // Drop vector index shadow tables, from the definitions the guard above
-        // already parsed.
-        for vix in &vector_indexes {
+    // Vector index shadow tables, from the definitions the guard above
+    // already parsed.
+    for vix in &vector_indexes {
+        if owns(format!(
+            "{}::vector::{}",
+            request.table_name, vix.index_name
+        ))
+        .await?
+        {
             storage
                 .drop_vector_table(&request.table_name, &vix.index_name)
                 .await?;
         }
+    }
 
-        // Drop data table
+    if owns(request.table_name.clone()).await? {
         storage.drop_data_table(&request.table_name).await?;
     }
 

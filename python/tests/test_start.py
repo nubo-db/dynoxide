@@ -317,16 +317,30 @@ def test_context_manager_stops_on_exit_and_on_error(start_fake: StartFake) -> No
     assert not other.is_running()
 
 
-def test_garbage_collected_server_is_stopped(start_fake: StartFake, fake_env: dict[str, str]) -> None:
-    from dynoxide._server import _launch
+def test_a_server_nobody_keeps_runs_until_stop(start_fake: StartFake, fake_env: dict[str, str]) -> None:
+    import weakref
+
+    from dynoxide._server import _launch, _running
 
     env = {**fake_env, "FAKE_MODE": "ready"}
-    server = _launch(binary=str(FAKE), command=[sys.executable], env=env, grace=0.5)
-    process = server._process
-    del server
+    kept = weakref.ref(_launch(binary=str(FAKE), command=[sys.executable], env=env, grace=0.5))
     gc.collect()
-    assert process.popen.returncode is not None
+    server = kept()
+    assert server is not None and server.is_running()
+    assert server.stop() == 0
+    assert server not in _running
     assert Path(fake_env["FAKE_MARKER"]).read_text() == "stdin"
+
+
+def test_a_server_nobody_stops_is_stopped_at_exit(tmp_path: Path, fake_env: dict[str, str]) -> None:
+    marker = tmp_path / "marker"
+    script = (
+        "import os, sys; from dynoxide._server import _launch; "
+        f"_launch(binary={str(FAKE)!r}, command=[sys.executable], env=dict(os.environ, FAKE_MODE='ready'))"
+    )
+    env = {**fake_env, "FAKE_MARKER": str(marker)}
+    subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=30)
+    assert marker.read_text() == "stdin"
 
 
 @pytest.mark.parametrize(

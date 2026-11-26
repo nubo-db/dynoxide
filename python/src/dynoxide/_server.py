@@ -47,6 +47,11 @@ _logger = logging.getLogger("dynoxide")
 # pipes. A process can't unregister a fork hook, so there's one for them all.
 _live: weakref.WeakSet[_Process] = weakref.WeakSet()
 
+# Every Server not yet stopped. Holding them here means a server started and
+# not kept, as in ``dynoxide.start(port=8000).export_env()``, runs until stop()
+# or exit rather than until the garbage collector finds it.
+_running: set[Server] = set()
+
 
 def _after_fork_in_child() -> None:
     for process in list(_live):
@@ -79,7 +84,8 @@ def start(
 
     The server listens on 127.0.0.1, on a free port unless ``port`` names one.
     It stops when you call ``stop()``, leave a ``with`` block, or when this
-    process exits, however it exits.
+    process exits, however it exits (with Dynoxide 1.7.0 or later: an older
+    binary is left running if this process is killed outright).
 
     Raises DynoxideError (or PortInUseError, a subclass) if it can't start.
     """
@@ -181,7 +187,7 @@ class Server:
     """A running Dynoxide server.
 
     Use it as a context manager, or call ``stop()`` when you're done. A server
-    nobody stops is stopped when it's garbage-collected or the process exits.
+    nobody stops runs until the process exits.
     """
 
     region = _env.REGION
@@ -198,7 +204,9 @@ class Server:
         self.pid = process.popen.pid
         self._process = process
         # Holds the process, never the Server, so the Server can be collected.
+        # Runs process.stop at exit. It holds the process, never the Server.
         self._finalizer = weakref.finalize(self, process.stop)
+        _running.add(self)
 
     def client_kwargs(self) -> dict[str, str]:
         """Arguments for ``boto3.client("dynamodb", **...)`` or ``resource(...)``."""
@@ -230,7 +238,10 @@ class Server:
         Safe to call more than once. In a process forked after start() it does
         nothing and returns None: the server belongs to the parent.
         """
-        return self._process.stop()
+        status = self._process.stop()
+        if os.getpid() == self._process.owner:
+            _running.discard(self)
+        return status
 
     def __enter__(self) -> Server:
         return self

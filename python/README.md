@@ -23,7 +23,7 @@ with dynoxide.start() as server:
     print(client.list_tables()["TableNames"])
 ```
 
-`start()` runs the server on 127.0.0.1 on a free port and returns once it's ready for requests. Leaving the `with` block stops it. Without a `with`, call `server.stop()`. A server you forget to stop still goes away when Python exits, however it exits, even with `kill -9`.
+`start()` runs the server on 127.0.0.1 on a free port and returns once it's ready for requests. Leaving the `with` block stops it. Without a `with`, call `server.stop()`. A server you forget to stop, or don't keep a reference to, runs until Python exits, and goes away then however Python exits, even with `kill -9`. That last part needs Dynoxide 1.7.0 or later: an older binary given through `binary=` or `DYNOXIDE_BINARY` is left running if Python is killed outright.
 
 `client_kwargs()` holds the endpoint, the region (`us-east-1`) and a pair of dummy credentials (`dynoxide` / `dynoxide`). Dynoxide accepts any credentials, so nothing real is needed.
 

@@ -151,6 +151,10 @@ impl StorageBackend for TestBackend {
         unimplemented!()
     }
 
+    async fn table_name_taken(&self, _table_name: &str) -> Result<bool, BackendError> {
+        unimplemented!()
+    }
+
     async fn create_data_table(&self, _table_name: &str) -> Result<(), BackendError> {
         unimplemented!()
     }

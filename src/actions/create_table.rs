@@ -172,10 +172,7 @@ pub async fn execute<S: StorageBackend>(
     }
 
     if storage.table_exists(&request.table_name).await? {
-        return Err(DynoxideError::ResourceInUseException(format!(
-            "Table already exists: {}",
-            request.table_name
-        )));
+        return Err(table_already_exists(&request.table_name));
     }
 
     let now = SystemTime::now()
@@ -261,68 +258,88 @@ pub async fn execute<S: StorageBackend>(
     }
 
     let billing_mode_str = request.billing_mode.as_deref().unwrap_or("PROVISIONED");
-    storage
-        .insert_table_metadata(&crate::storage::CreateTableMetadata {
-            table_name: &request.table_name,
-            key_schema: &key_schema_json,
-            attribute_definitions: &attr_defs_json,
-            gsi_definitions: gsi_json.as_deref(),
-            lsi_definitions: lsi_json.as_deref(),
-            provisioned_throughput: pt_json.as_deref(),
-            created_at: now,
-            sse_specification: sse_json.as_deref(),
-            table_class: request.table_class.as_deref(),
-            deletion_protection_enabled: deletion_protection,
-            billing_mode: Some(billing_mode_str),
-            on_demand_throughput: on_demand_json.as_deref(),
-            vector_index_definitions: vector_json.as_deref(),
-        })
-        .await?;
-
-    storage.create_data_table(&request.table_name).await?;
-
-    if let Some(ref gsis) = request.global_secondary_indexes {
-        for gsi in gsis {
-            storage
-                .create_gsi_table(&request.table_name, &gsi.index_name)
-                .await?;
+    // Every write in one transaction, so a step that fails leaves nothing
+    // behind: no listed table without its data table, no stray index table.
+    let created = super::helpers::with_write_transaction(storage, async {
+        // Asked again under the write lock, so another process sharing the
+        // file can't take the name between the check and the writes. SQLite
+        // compares table names ignoring case and keeps some for itself, and
+        // each table is stored under its own name, so `users` beside `Users`,
+        // a case of one of Dynoxide's own tables, or a `sqlite_` name can't
+        // be stored either: refuse those as a table that already exists,
+        // though DynamoDB itself would accept them.
+        if storage.table_exists(&request.table_name).await?
+            || storage.table_name_taken(&request.table_name).await?
+            || crate::storage_backend::sql_builders::is_reserved_table_name(&request.table_name)
+        {
+            return Err(table_already_exists(&request.table_name));
         }
-    }
-
-    if let Some(ref lsis) = request.local_secondary_indexes {
-        for lsi in lsis {
-            storage
-                .create_lsi_table(&request.table_name, &lsi.index_name)
-                .await?;
-        }
-    }
-
-    if let Some(ref vixs) = request.vector_indexes {
-        for vix in vixs {
-            storage
-                .create_vector_table(&request.table_name, &vix.index_name)
-                .await?;
-        }
-    }
-
-    if let Some(ref spec) = request.stream_specification
-        && spec.stream_enabled
-    {
-        let view_type = spec
-            .stream_view_type
-            .as_deref()
-            .unwrap_or("NEW_AND_OLD_IMAGES");
-        let label = streams::generate_stream_label(storage.clock());
         storage
-            .enable_stream(&request.table_name, view_type, &label)
+            .insert_table_metadata(&crate::storage::CreateTableMetadata {
+                table_name: &request.table_name,
+                key_schema: &key_schema_json,
+                attribute_definitions: &attr_defs_json,
+                gsi_definitions: gsi_json.as_deref(),
+                lsi_definitions: lsi_json.as_deref(),
+                provisioned_throughput: pt_json.as_deref(),
+                created_at: now,
+                sse_specification: sse_json.as_deref(),
+                table_class: request.table_class.as_deref(),
+                deletion_protection_enabled: deletion_protection,
+                billing_mode: Some(billing_mode_str),
+                on_demand_throughput: on_demand_json.as_deref(),
+                vector_index_definitions: vector_json.as_deref(),
+            })
             .await?;
-    }
 
-    if let Some(ref tags) = request.tags
-        && !tags.is_empty()
-    {
-        storage.set_tags(&request.table_name, tags).await?;
-    }
+        storage.create_data_table(&request.table_name).await?;
+
+        if let Some(ref gsis) = request.global_secondary_indexes {
+            for gsi in gsis {
+                storage
+                    .create_gsi_table(&request.table_name, &gsi.index_name)
+                    .await?;
+            }
+        }
+
+        if let Some(ref lsis) = request.local_secondary_indexes {
+            for lsi in lsis {
+                storage
+                    .create_lsi_table(&request.table_name, &lsi.index_name)
+                    .await?;
+            }
+        }
+
+        if let Some(ref vixs) = request.vector_indexes {
+            for vix in vixs {
+                storage
+                    .create_vector_table(&request.table_name, &vix.index_name)
+                    .await?;
+            }
+        }
+
+        if let Some(ref spec) = request.stream_specification
+            && spec.stream_enabled
+        {
+            let view_type = spec
+                .stream_view_type
+                .as_deref()
+                .unwrap_or("NEW_AND_OLD_IMAGES");
+            let label = streams::generate_stream_label(storage.clock());
+            storage
+                .enable_stream(&request.table_name, view_type, &label)
+                .await?;
+        }
+
+        if let Some(ref tags) = request.tags
+            && !tags.is_empty()
+        {
+            storage.set_tags(&request.table_name, tags).await?;
+        }
+        Ok(())
+    })
+    .await;
+    created?;
 
     let meta = storage
         .get_table_metadata(&request.table_name)
@@ -610,10 +627,13 @@ fn validate_vector_index_list(
         )?;
     }
 
-    // Duplicate index names within the vector list.
+    // Duplicate index names within the vector list,
+    // ignoring case: each index is stored in an SQLite table named after it,
+    // and SQLite compares table names ignoring case, so `byG` and `BYG` would
+    // share one. DynamoDB itself treats them as different indexes.
     let mut seen = std::collections::HashSet::new();
     for vix in vixs {
-        if !seen.insert(&vix.index_name) {
+        if !seen.insert(vix.index_name.to_ascii_lowercase()) {
             return Err(ve(format!(
                 "One or more parameter values were invalid: Duplicate index name: {}",
                 vix.index_name
@@ -1355,6 +1375,10 @@ fn collect_proj_errors(
     }
 }
 
+fn table_already_exists(table_name: &str) -> DynoxideError {
+    DynoxideError::ResourceInUseException(format!("Table already exists: {table_name}"))
+}
+
 // ---- Structural validation helpers ----
 
 fn validate_key_schema_structure(ks: &[KeySchemaElement]) -> std::result::Result<(), String> {
@@ -1521,10 +1545,10 @@ fn validate_lsi_list(
         validate_lsi_structure(lsi, ks)?;
     }
 
-    // Duplicate index names
+    // Duplicate index names, ignoring case (see `validate_gsi_list`)
     let mut seen = std::collections::HashSet::new();
     for lsi in lsis {
-        if !seen.insert(&lsi.index_name) {
+        if !seen.insert(lsi.index_name.to_ascii_lowercase()) {
             return Err(format!(
                 "One or more parameter values were invalid: Duplicate index name: {}",
                 lsi.index_name
@@ -1559,10 +1583,13 @@ fn validate_gsi_list(
         validate_gsi_structure(gsi)?;
     }
 
-    // Duplicate index names
+    // Duplicate index names,
+    // ignoring case: each index is stored in an SQLite table named after it,
+    // and SQLite compares table names ignoring case, so `byG` and `BYG` would
+    // share one. DynamoDB itself treats them as different indexes.
     let mut seen = std::collections::HashSet::new();
     for gsi in gsis {
-        if !seen.insert(&gsi.index_name) {
+        if !seen.insert(gsi.index_name.to_ascii_lowercase()) {
             return Err(format!(
                 "One or more parameter values were invalid: Duplicate index name: {}",
                 gsi.index_name

@@ -756,6 +756,20 @@ impl StorageBackend for WasmBridgeBackend {
         Ok(col_i64(&row, 0) == 1)
     }
 
+    async fn table_name_taken(&self, table_name: &str) -> Result<bool, BackendError> {
+        let rows = self
+            .query(
+                sql_builders::TABLE_NAME_TAKEN,
+                vec![SqlParam::text(table_name)],
+            )
+            .await?;
+        if rows.length() == 0 {
+            return Ok(false);
+        }
+        let row: js_sys::Array = rows.get(0).unchecked_into();
+        Ok(col_i64(&row, 0) == 1)
+    }
+
     // --- Data tables -----------------------------------------------------
 
     async fn create_data_table(&self, table_name: &str) -> Result<(), BackendError> {

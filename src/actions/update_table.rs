@@ -540,9 +540,12 @@ pub async fn execute<S: StorageBackend>(
     if let Some(ref updates) = request.global_secondary_index_updates {
         for update in updates {
             if let Some(ref create) = update.create {
+                // Ignoring case: each index is stored in an SQLite table
+                // named after it, and SQLite compares table names ignoring
+                // case, so `byG` beside `BYG` would share one.
                 if current_gsis
                     .iter()
-                    .any(|g| g.index_name == create.index_name)
+                    .any(|g| g.index_name.eq_ignore_ascii_case(&create.index_name))
                 {
                     return Err(DynoxideError::ValidationException(format!(
                         "One or more parameter values were invalid: \
@@ -709,9 +712,11 @@ pub async fn execute<S: StorageBackend>(
                 // index families: a name held by a live GSI or LSI collides
                 // too, with the same wording. Captured from real DynamoDB
                 // (eu-west-2 and us-east-1, 2026-08-12).
+                // A vector index ignores case against its own family, whose
+                // SQLite tables share a prefix (see the GSI check above).
                 if current_vixs
                     .iter()
-                    .any(|v| v.index_name == create.index_name)
+                    .any(|v| v.index_name.eq_ignore_ascii_case(&create.index_name))
                     || current_gsis
                         .iter()
                         .any(|g| g.index_name == create.index_name)
@@ -1411,7 +1416,9 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
             }
         }
 
-        // Check repeated index names
+        // Check repeated index names, ignoring case: each index is stored in
+        // an SQLite table named after it, and SQLite compares table names
+        // ignoring case, so creating `byG` and `BYG` together would make one.
         let mut seen_names = std::collections::HashSet::new();
         for update in updates {
             let name = if let Some(ref u) = update.update {
@@ -1422,7 +1429,7 @@ fn validate_update_request(request: &UpdateTableRequest) -> Result<()> {
                 update.delete.as_ref().map(|d| d.index_name.as_str())
             };
             if let Some(name) = name
-                && !seen_names.insert(name.to_string())
+                && !seen_names.insert(name.to_ascii_lowercase())
             {
                 return Err(DynoxideError::ValidationException(format!(
                     "One or more parameter values were invalid: Only one global secondary index update per index is allowed simultaneously. Index: {}",

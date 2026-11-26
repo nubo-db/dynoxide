@@ -164,6 +164,31 @@ pub const GET_SCHEMA_VERSION: &str = "SELECT value FROM _config WHERE key = 'sch
 pub const TABLE_EXISTS: &str =
     "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)";
 
+/// Whether a new table can't be stored under `?1`, as `0` or `1`: SQLite
+/// holds a table of that name ignoring case, which is how SQLite compares
+/// table names; the name starts `sqlite_`, which SQLite keeps for itself
+/// (ignoring case too); or `_tables` lists a table under that name in another
+/// case, which a file an earlier release damaged can, and whose reads and
+/// writes would reach the new table.
+pub const TABLE_NAME_TAKEN: &str = "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+     WHERE type = 'table' AND name = ?1 COLLATE NOCASE) \
+     OR ?1 LIKE 'sqlite\\_%' ESCAPE '\\' \
+     OR EXISTS (SELECT 1 FROM _tables WHERE table_name = ?1 COLLATE NOCASE)";
+
+/// The tables Dynoxide keeps for itself. A DynamoDB table can't be stored
+/// under one of these names in any case, since SQLite compares table names
+/// ignoring case.
+pub const OWN_TABLES: [&str; 3] = ["_tables", "_config", "_stream_records"];
+
+/// Whether `name` is one of Dynoxide's own tables or a name SQLite keeps for
+/// itself, ignoring case. No DynamoDB table is ever stored under one.
+pub fn is_reserved_table_name(name: &str) -> bool {
+    OWN_TABLES.iter().any(|own| own.eq_ignore_ascii_case(name))
+        || name
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("sqlite_"))
+}
+
 /// Idempotent schema bootstrap shared by both backends: the metadata, config,
 /// and stream-record tables at the current schema version. Native
 /// `Storage::initialize` runs this (then layers WAL, custom functions, and

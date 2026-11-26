@@ -41,6 +41,9 @@ summary.
   statement is read. Dynoxide reports the second and DynamoDB the first.
 - **Map order in an error that echoes a too-long request back** can differ for
   entries that land in the same hash bucket.
+- **Table and index names that differ only in case** are refused, along with
+  table names starting `sqlite_` and the names of Dynoxide's own tables.
+  DynamoDB accepts them.
 
 The compatibility summary's
 [Known Remaining Limitations](compatibility-summary.md#known-remaining-limitations)

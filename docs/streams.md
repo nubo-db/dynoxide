@@ -43,7 +43,7 @@ aws dynamodbstreams get-shard-iterator \
   --shard-iterator-type TRIM_HORIZON
 ```
 
-Each stream has one shard. Its ID has DynamoDB's shape, such as
+Each stream has one shard. Its ID is shaped like DynamoDB's, such as
 `shardId-00000001795697354493-ebb9c0b7`, and stays the same for the life of the
 stream. Releases before 1.8.1 returned `shardId-00000001-` followed by the table
 name, and GetShardIterator still accepts that form.

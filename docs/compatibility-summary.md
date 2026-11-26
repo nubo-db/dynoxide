@@ -17,7 +17,7 @@ Conformance fixes ship as patch releases (minor releases up to 1.8.0), so behavi
 ### 1.8.1
 
 - **Answers change shape.** DescribeStream returns a `ShardId` of 37
-  characters in DynamoDB's shape, such as
+  characters shaped like DynamoDB's, such as
   `shardId-00000001795697354493-ebb9c0b7`, in place of `shardId-00000001-`
   followed by the table name. A new stream on the same table gets a new ID.
   GetShardIterator still accepts the old form.

@@ -15,16 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or `dynoxide:1.8` no longer holds behaviour still. Pin an exact version to
   do that. [versioning.md](docs/versioning.md) has the details for each
   package manager.
-- **DescribeStream returns a `ShardId` in DynamoDB's shape.** It's now
+- **DescribeStream returns a `ShardId` shaped like DynamoDB's.** It's now
   `shardId-`, 20 digits, `-` and 8 hex digits, 37 characters whatever the
-  table's name. It used to be `shardId-00000001-` followed by the table name,
-  which boto3 and the PHP SDK refuse before sending GetShardIterator when the
-  name is under 11 characters, and which ran past the 65 characters DynamoDB's
-  API allows when the name was over 48. A stream keeps its ID across restarts,
-  and a new stream on the same table, after disabling and re-enabling it or
-  recreating the table, gets a new one. GetShardIterator still accepts the old
-  form, and shard iterators from earlier releases still read, so a consumer
-  that kept either keeps working. Database files need no upgrade.
+  table's name, the shape of the example in DynamoDB's API reference. It used
+  to be `shardId-00000001-` followed by the table name, which boto3 and the
+  PHP SDK refuse before sending GetShardIterator when the name is under 11
+  characters, and which ran past the 65 characters DynamoDB's API allows when
+  the name was over 48. A stream keeps its ID across restarts, and a new
+  stream on the same table, after disabling and re-enabling it or recreating
+  the table, gets a new one. GetShardIterator still accepts the old form, and
+  shard iterators from earlier releases still read, so a consumer that kept
+  either keeps working. Database files need no upgrade.
   ([#361](https://github.com/nubo-db/dynoxide/issues/361))
 
 ### Added

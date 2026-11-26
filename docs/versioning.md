@@ -189,8 +189,8 @@ be filed under it.
 
 Occasionally a conformance fix is disruptive enough that shipping it as a patch
 is indefensible, and it takes a minor or a major instead. When that happens the
-release note names the consumer behaviour that could not be carried across, and why
-listing it as a behaviour change was not enough.
+release note names the consumer behaviour that could not be carried across,
+and why listing it as a behaviour change was not enough.
 
 ## What `^1.0.0` gives you, and what it does not
 

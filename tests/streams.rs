@@ -989,11 +989,38 @@ fn assert_aws_shard_id(id: &str) {
 #[test]
 fn shard_ids_are_aws_shaped_whatever_the_table_name() {
     let db = Database::memory().unwrap();
+    let mut ids = std::collections::HashSet::new();
     for len in [3, 10, 11, 48, 49, 255] {
         let name = "t".repeat(len);
         create_stream_table(&db, &name, "NEW_IMAGE");
-        assert_aws_shard_id(&described_shard_id(&db, &name));
+        let id = described_shard_id(&db, &name);
+        assert_aws_shard_id(&id);
+        ids.insert(id);
     }
+    assert_eq!(ids.len(), 6, "each table's stream should have its own ID");
+}
+
+#[test]
+fn a_shard_id_carries_the_stream_creation_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.db");
+    let path = path.to_str().unwrap();
+    {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+    }
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE _tables SET stream_label = '1700000000.123456789' WHERE table_name = 'Evt'",
+        )
+        .unwrap();
+    let db = Database::new(path).unwrap();
+    let id = described_shard_id(&db, "Evt");
+    assert_aws_shard_id(&id);
+    // The digits are the label's milliseconds. The ID must not change across
+    // an upgrade, so the whole value is pinned, hash included.
+    assert_eq!(id, "shardId-00000001700000000123-19f27ce2");
 }
 
 #[test]
@@ -1085,6 +1112,8 @@ fn a_shard_id_from_an_earlier_stream_reads_nothing() {
 
     let stale = iterator_for(&db, "Evt", &old, "TRIM_HORIZON");
     assert!(get_records(&db, &stale).records.is_empty());
+    let current = iterator_for(&db, "Evt", &described_shard_id(&db, "Evt"), "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &current)), ["a"]);
 }
 
 #[test]
@@ -1158,6 +1187,7 @@ fn a_stream_with_no_stored_label_still_gets_a_valid_shard_id() {
         described_shard_id(&db, "Evt")
     };
     assert_aws_shard_id(&id);
+    assert!(id.starts_with("shardId-00000000000000000000-"), "{id}");
     let db = Database::new(path).unwrap();
     assert_eq!(described_shard_id(&db, "Evt"), id);
 }

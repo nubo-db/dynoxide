@@ -81,12 +81,6 @@ pub async fn execute<S: StorageBackend>(
         )));
     }
 
-    let shard_id = crate::streams::requested_shard_id(
-        &table_name,
-        meta.stream_label.as_deref(),
-        &request.shard_id,
-    );
-
     let kind = request.shard_iterator_type.as_str();
     if matches!(kind, "TRIM_HORIZON" | "LATEST") && request.sequence_number.is_some() {
         return Err(DynoxideError::ValidationException(
@@ -94,6 +88,28 @@ pub async fn execute<S: StorageBackend>(
                 .to_string(),
         ));
     }
+
+    // A ShardId the stream doesn't answer to is refused as DynamoDB refuses it
+    // (eu-west-2, 26 November 2026). Records an import wrote before 1.5.0, in
+    // the form `shardId-{table}-000000`, are still reachable by that ID.
+    let shard_id = match crate::streams::requested_shard_id(
+        &table_name,
+        meta.stream_label.as_deref(),
+        &request.shard_id,
+    ) {
+        Some(stored) => stored,
+        None => {
+            let (first, _) = storage
+                .get_shard_sequence_range(&table_name, &request.shard_id)
+                .await?;
+            if first.is_none() {
+                return Err(DynoxideError::ResourceNotFoundException(
+                    "Requested resource not found: Shard does not exist".to_string(),
+                ));
+            }
+            request.shard_id.clone()
+        }
+    };
 
     let position = match kind {
         "TRIM_HORIZON" => 0,

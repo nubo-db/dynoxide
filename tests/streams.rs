@@ -1101,8 +1101,42 @@ fn a_new_stream_on_the_same_table_has_a_new_shard_id() {
     assert_ne!(recreated, reenabled);
 }
 
+fn shard_not_found(db: &Database, table: &str, shard_id: &str) -> String {
+    let req = json!({
+        "StreamArn": get_stream_arn(db, table),
+        "ShardId": shard_id,
+        "ShardIteratorType": "TRIM_HORIZON"
+    });
+    match db.get_shard_iterator(serde_json::from_value(req).unwrap()) {
+        Err(dynoxide::DynoxideError::ResourceNotFoundException(msg)) => msg,
+        other => panic!("{shard_id}: {other:?}"),
+    }
+}
+
+// DynamoDB answers a ShardId the stream doesn't have with this (eu-west-2,
+// 26 November 2026), for an ID it never had and for the previous stream's
+// shard asked for through the new stream's ARN.
+const SHARD_NOT_FOUND: &str = "Requested resource not found: Shard does not exist";
+
 #[test]
-fn a_shard_id_from_an_earlier_stream_reads_nothing() {
+fn a_shard_id_the_stream_never_had_is_refused() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "a", "1");
+    create_stream_table(&db, "Other", "NEW_IMAGE");
+    put_item(&db, "Other", "b", "1");
+
+    for id in [
+        "shardId-00000000000000000000-00000000".to_string(),
+        described_shard_id(&db, "Other"),
+        "shardId-00000001-Other".to_string(),
+    ] {
+        assert_eq!(shard_not_found(&db, "Evt", &id), SHARD_NOT_FOUND, "{id}");
+    }
+}
+
+#[test]
+fn a_shard_id_from_an_earlier_stream_is_refused() {
     let db = Database::memory().unwrap();
     create_stream_table(&db, "Evt", "NEW_IMAGE");
     let old = described_shard_id(&db, "Evt");
@@ -1110,8 +1144,7 @@ fn a_shard_id_from_an_earlier_stream_reads_nothing() {
     set_stream(&db, "Evt", true);
     put_item(&db, "Evt", "a", "1");
 
-    let stale = iterator_for(&db, "Evt", &old, "TRIM_HORIZON");
-    assert!(get_records(&db, &stale).records.is_empty());
+    assert_eq!(shard_not_found(&db, "Evt", &old), SHARD_NOT_FOUND);
     let current = iterator_for(&db, "Evt", &described_shard_id(&db, "Evt"), "TRIM_HORIZON");
     assert_eq!(record_keys(&get_records(&db, &current)), ["a"]);
 }
@@ -1155,6 +1188,64 @@ fn a_database_file_keeps_its_stored_shard_ids_and_reads_through_the_new_one() {
     assert_eq!(record_keys(&get_records(&db, &current)), ["a"]);
     let legacy = iterator_for(&db, "Evt", "shardId-Evt-000000", "TRIM_HORIZON");
     assert_eq!(record_keys(&get_records(&db, &legacy)), ["b"]);
+}
+
+#[test]
+fn the_shard_id_form_from_earlier_releases_reads_an_empty_stream() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let iterator = iterator_for(&db, "Evt", "shardId-00000001-Evt", "LATEST");
+    put_item(&db, "Evt", "a", "1");
+    assert_eq!(record_keys(&get_records(&db, &iterator)), ["a"]);
+}
+
+fn update_stream_error(db: &Database, table: &str, view_type: &str) -> String {
+    let req = json!({
+        "TableName": table,
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type}
+    });
+    match db.update_table(serde_json::from_value(req).unwrap()) {
+        Err(dynoxide::DynoxideError::ValidationException(msg)) => msg,
+        other => panic!("{view_type}: {other:?}"),
+    }
+}
+
+#[test]
+fn enabling_a_stream_that_is_already_enabled_is_refused() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_AND_OLD_IMAGES");
+    put_item(&db, "Evt", "a", "1");
+    let arn = get_stream_arn(&db, "Evt");
+    let id = described_shard_id(&db, "Evt");
+
+    // DynamoDB's answer for the same view type and for a different one
+    // (eu-west-2, 26 November 2026). The stream is left as it was.
+    for view_type in ["NEW_AND_OLD_IMAGES", "KEYS_ONLY"] {
+        assert_eq!(
+            update_stream_error(&db, "Evt", view_type),
+            "Table already has an enabled stream: TableName: Evt"
+        );
+    }
+    assert_eq!(get_stream_arn(&db, "Evt"), arn);
+    assert_eq!(described_shard_id(&db, "Evt"), id);
+    let req = json!({"StreamArn": arn});
+    let described = db
+        .describe_stream(serde_json::from_value(req).unwrap())
+        .unwrap();
+    assert_eq!(
+        described.stream_description.stream_view_type,
+        "NEW_AND_OLD_IMAGES"
+    );
+    let iterator = iterator_for(&db, "Evt", &id, "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &iterator)), ["a"]);
+}
+
+#[test]
+fn a_table_without_a_stream_can_still_enable_one() {
+    let db = Database::memory().unwrap();
+    create_table_no_stream(&db, "Evt");
+    set_stream(&db, "Evt", true);
+    assert_aws_shard_id(&described_shard_id(&db, "Evt"));
 }
 
 #[test]

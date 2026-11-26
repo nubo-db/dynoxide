@@ -43,10 +43,15 @@ aws dynamodbstreams get-shard-iterator \
   --shard-iterator-type TRIM_HORIZON
 ```
 
-Each stream has one shard. Its ID is shaped like DynamoDB's, such as
+Each stream has one shard. Its ID has DynamoDB's shape, such as
 `shardId-00000001795697354493-ebb9c0b7`, and stays the same for the life of the
 stream. Releases before 1.8.1 returned `shardId-00000001-` followed by the table
-name, and GetShardIterator still accepts that form.
+name, and GetShardIterator still accepts that form. Any other ID is refused with
+`ResourceNotFoundException`, as DynamoDB refuses it.
+
+To change a stream's view type, disable the stream and enable it again. Enabling
+a stream that is already enabled fails with `ValidationException`, as it does on
+DynamoDB, and the new stream has a new ARN and shard ID.
 
 ## Streams with import
 

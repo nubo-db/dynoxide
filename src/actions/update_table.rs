@@ -452,6 +452,22 @@ pub async fn execute<S: StorageBackend>(
         .into());
     }
 
+    // Enabling a stream that is already enabled is refused whatever the view
+    // type, and the stream is left as it was (eu-west-2, 26 November 2026).
+    // Without this the table got a new label, and with it a new stream ARN and
+    // ShardId, under any consumer reading it.
+    if request
+        .stream_specification
+        .as_ref()
+        .is_some_and(|spec| spec.stream_enabled)
+        && meta.stream_enabled
+    {
+        return Err(DynoxideError::ValidationException(format!(
+            "Table already has an enabled stream: TableName: {}",
+            request.table_name
+        )));
+    }
+
     // Parse existing GSI definitions
     let mut current_gsis: Vec<GlobalSecondaryIndex> = meta
         .gsi_definitions

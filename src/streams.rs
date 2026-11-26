@@ -75,15 +75,16 @@ pub(crate) fn public_shard_id(table_name: &str, label: Option<&str>) -> String {
     format!("shardId-{millis:020}-{}", &hex[..8])
 }
 
-/// The stored shard ID a GetShardIterator `ShardId` refers to. The stream's
-/// public ID maps to the stored form. Anything else, such as the stored form
-/// itself, which earlier releases returned, passes through unchanged.
-pub(crate) fn requested_shard_id(table_name: &str, label: Option<&str>, requested: &str) -> String {
-    if requested == public_shard_id(table_name, label) {
-        shard_id(table_name)
-    } else {
-        requested.to_string()
-    }
+/// The stored shard ID a GetShardIterator `ShardId` refers to, when it is one
+/// the stream answers to: its public ID, or the stored form, which releases
+/// before 1.8.1 returned from DescribeStream. Anything else is `None`.
+pub(crate) fn requested_shard_id(
+    table_name: &str,
+    label: Option<&str>,
+    requested: &str,
+) -> Option<String> {
+    let stored = shard_id(table_name);
+    (requested == stored || requested == public_shard_id(table_name, label)).then_some(stored)
 }
 
 /// Offset that turns a stored sequence number into its 21-digit public form.

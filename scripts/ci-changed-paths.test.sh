@@ -44,6 +44,8 @@ expect false true "docs plus one source file" $'docs/import.md\nsrc/lib.rs'
 expect false true "rename out of code (both paths listed)" $'src/legacy.rs\ndocs/legacy.md'
 expect false true "packaged crate readme" "README-crate.md"
 expect false true "npm package readme" "npm/dynoxide/README.md"
+expect false true "PyPI package readme" "python/README.md"
+expect false true "Python package code" "python/src/dynoxide/_server.py"
 expect false true "benchmarks readme" "benchmarks/README.md"
 # The Docker filter anchors only the start of each path, as it always has, so
 # README.mdx also runs the smoke test. That errs towards running it.

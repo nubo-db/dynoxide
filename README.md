@@ -4,7 +4,7 @@
 
 A DynamoDB emulator in Rust, backed by SQLite. Runs as an HTTP server or an MCP server for coding agents, embeds into Rust and iOS applications as a library, and compiles to WebAssembly for the browser.
 
-> The crates.io badge above shows the **crate** version, which covers the Rust library alone. Everything you install rather than depend on carries a separate **product** version: the binary, the npm packages, the container images, the browser engine and the Action. That is the number `dynoxide --version` prints and the one to quote in a bug report. [Why there are two](docs/versioning.md).
+> The crates.io badge above shows the **crate** version, which covers the Rust library alone. Everything you install rather than depend on carries a separate **product** version: the binary, the npm packages, the PyPI package, the container images, the browser engine and the Action. That is the number `dynoxide --version` prints and the one to quote in a bug report. [Why there are two](docs/versioning.md).
 
 ## Why Dynoxide?
 
@@ -82,6 +82,8 @@ npm install --save-dev dynoxide
 
 In a Node test suite, the package's `start()` runs a server on a free port and stops it when the tests finish. See [starting a server from your tests](https://github.com/nubo-db/dynoxide/blob/main/npm/dynoxide/README.md#starting-a-server-from-your-tests).
 
+For Python, `pip install dynoxide` gives you the same `start()` and pytest fixtures, with the binary inside the wheel. See the [Python package](https://github.com/nubo-db/dynoxide/blob/main/python/README.md).
+
 Or run it in Docker, a drop-in for `amazon/dynamodb-local`:
 
 ```sh
@@ -105,7 +107,7 @@ unchanged.
 
 ## Documentation
 
-- [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, Homebrew, Cargo, binaries, GitHub Actions, and Docker
+- [Installation](https://github.com/nubo-db/dynoxide/blob/main/docs/installation.md) - npm, pip, Homebrew, Cargo, binaries, GitHub Actions, and Docker
 - [HTTP server](https://github.com/nubo-db/dynoxide/blob/main/docs/http-server.md) - running the DynamoDB-compatible HTTP API
 - [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
 - [Writing a launcher](https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md) - how a wrapper for another language finds, starts and stops the binary

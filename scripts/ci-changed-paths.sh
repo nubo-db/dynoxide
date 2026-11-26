@@ -12,7 +12,7 @@
 # is an allowlist of docs, not a denylist of code, so a file nobody thought
 # about runs the full suite. Entries match whole paths: top-level files exactly,
 # directories by prefix. README-crate.md is the crate's packaged readme and the
-# READMEs under npm/ ship in packages, so neither is on the list.
+# READMEs under npm/ and python/ ship in packages, so none of them is on the list.
 #
 # An empty list gives code=true. The caller handles a missing or unreachable
 # diff base itself, by not calling this and running everything.

@@ -12,6 +12,17 @@ Or run directly without installing:
 npx dynoxide --port 8000
 ```
 
+## pip (Python)
+
+```sh
+pip install dynoxide
+```
+
+The wheel carries the binary for your platform, so nothing is downloaded when
+it runs. It adds a `dynoxide` command, `dynoxide.start()` for starting a server
+from Python, and pytest fixtures. See the
+[package README](https://github.com/nubo-db/dynoxide/blob/main/python/README.md).
+
 ## Homebrew (macOS and Linux)
 
 ```sh

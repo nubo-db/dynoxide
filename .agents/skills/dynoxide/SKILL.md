@@ -27,7 +27,9 @@ In a Node test suite, use the npm package's `start()`, which picks a free port
 and hands back the endpoint. Pass `port` only when something needs the
 endpoint in advance, such as a dev setup; `start()` rejects with
 `DYNOXIDE_PORT_IN_USE` if that port is taken, and the binary exits `4` (1.8.0
-or later). From anything else, start
+or later). In a Python project, `pip install dynoxide` gives the same
+`start()` and pytest fixtures (`dynamodb_client`, `dynoxide`). From anything
+else, start
 `dynoxide --port 0 --ready-json --exit-with-parent` with stdin on a pipe. Once
 it's ready it prints one JSON line on stdout with the `endpoint`, and it shuts
 down cleanly when stdin closes, so the server stops even if the test runner is

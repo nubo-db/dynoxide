@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A Python package.** `pip install dynoxide` installs Dynoxide with a
+  `start()` function and a pytest plugin. It is published to PyPI from each
+  release, starting with 1.8.0.
+
 ## [1.8.0] - 2026-11-20
 
 The crate moves to `dynoxide-rs` 4.1.0. `server::bind` is new, and

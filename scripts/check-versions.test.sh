@@ -18,18 +18,24 @@ failures=0
 checked=0
 
 # Writes a tree in which every source agrees: the product version in VERSION,
-# the bundle manifest and the engine package; the crate version in Cargo.toml
+# the bundle manifest, the engine package and the Python package; the crate
+# version in Cargo.toml
 # and Cargo.lock. The lockfile carries a second package so the check has to
 # find the right block rather than the first one.
 fixture() {
   local product=${1:-1.2.0} crate=${2:-2.0.0}
   rm -rf "${FIXTURE:?}"/* "${FIXTURE:?}"/.[!.]* 2>/dev/null || true
-  mkdir -p "$FIXTURE/mcpb" "$FIXTURE/npm/wasm-engine" "$FIXTURE/dist"
+  mkdir -p "$FIXTURE/mcpb" "$FIXTURE/npm/wasm-engine" "$FIXTURE/dist" "$FIXTURE/python/src/dynoxide"
   echo "$product" > "$FIXTURE/VERSION"
   printf '[package]\nname = "dynoxide-rs"\nversion = "%s"\n' "$crate" > "$FIXTURE/Cargo.toml"
   printf '[[package]]\nname = "aardvark"\nversion = "9.9.9"\n\n[[package]]\nname = "dynoxide-rs"\nversion = "%s"\ndependencies = [\n "aardvark",\n]\n' "$crate" > "$FIXTURE/Cargo.lock"
   printf '{"name": "dynoxide", "version": "%s"}\n' "$product" > "$FIXTURE/mcpb/manifest.json"
   printf '{"name": "@dynoxide/wasm-engine", "version": "%s"}\n' "$product" > "$FIXTURE/npm/wasm-engine/package.json"
+  python_version "$product" "$(bash "$SCRIPTS/pypi-version.sh" "$product" 2>/dev/null || echo none)"
+}
+
+python_version() {
+  printf '# comment\nENGINE_VERSION = "%s"\n\n__version__ = "%s"\n' "$1" "$2" > "$FIXTURE/python/src/dynoxide/_version.py"
 }
 
 # A stand-in for the built binary, reporting whatever version it is told to.
@@ -80,6 +86,26 @@ expect 1 "mcpb/manifest.json" "a stale bundle manifest is caught"
 fixture
 printf '{"name": "@dynoxide/wasm-engine", "version": "1.1.0"}\n' > "$FIXTURE/npm/wasm-engine/package.json"
 expect 1 "npm/wasm-engine/package.json" "a stale engine package is caught"
+
+fixture
+python_version 1.1.0 1.2.0
+expect 1 "ENGINE_VERSION in python/src/dynoxide/_version.py is '1.1.0'" "a stale Python engine version is caught"
+
+fixture
+python_version 1.2.0 1.1.0
+expect 1 "__version__ in python/src/dynoxide/_version.py is '1.1.0'" "a stale Python package version is caught"
+
+fixture
+python_version 1.2.0 1.2.0.post1
+expect 1 "__version__ in python/src/dynoxide/_version.py is '1.2.0.post1'" "a committed post-release is caught"
+
+fixture 1.3.0-rc.1
+python_version 1.3.0-rc.1 1.3.0-rc.1
+expect 1 "expected '1.3.0rc1'" "a semver-shaped Python prerelease is caught"
+
+fixture
+rm "$FIXTURE/python/src/dynoxide/_version.py"
+expect 1 "_version.py is missing" "a missing Python version file fails rather than reading clean"
 
 fixture
 printf '[package]\nname = "dynoxide-rs"\nversion = "2.0.1"\n' > "$FIXTURE/Cargo.toml"

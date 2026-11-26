@@ -14,9 +14,10 @@ schedule. Versioning follows [SemVer](https://semver.org).
 1. Benchmark numbers shown in the README are refreshed by an automated
    workflow that opens a "docs: update benchmark numbers" PR. The maintainer
    reviews the numbers and merges.
-2. The product version bump in `VERSION`, a crate version bump in
-   `Cargo.toml` if the Rust API changed, and a new `CHANGELOG.md` entry are
-   committed to `main`. The two versions move independently: see
+2. The product version bump in `VERSION` (and in
+   `python/src/dynoxide/_version.py`, which `scripts/check-versions.sh`
+   holds to it), a crate version bump in `Cargo.toml` if the Rust API
+   changed, and a new `CHANGELOG.md` entry are committed to `main`. The two versions move independently: see
    `docs/versioning.md`.
 3. A `v*` tag is pushed on that commit.
 4. The tag push triggers the release pipeline, which:
@@ -26,11 +27,11 @@ schedule. Versioning follows [SemVer](https://semver.org).
    - creates a GitHub Release with artefacts and checksums
    - pauses for one-click maintainer approval
    - publishes to crates.io, updates the Homebrew tap, publishes the npm
-     packages and pushes the Docker image.
+     packages and the PyPI package, and pushes the Docker image.
 
 The approval gate sits between the GitHub Release and the registry publishes,
 so a release can still be aborted before anything reaches crates.io, Homebrew,
-npm, or any container registry.
+npm, PyPI, or any container registry.
 
 The gate doesn't cover the GitHub Release itself. The release is created
 before the pause, and its artefacts can be downloaded as soon as it exists,
@@ -41,10 +42,23 @@ matters.
 A prerelease tag such as `vX.Y.Z-rc.1` runs the same pipeline, but only
 reaches people who ask for it. Its GitHub Release is flagged as a prerelease,
 so `version: latest` keeps resolving to the last stable release. npm publishes
-it to `next`, and the image gets its exact tag and no other. A stable crate
+it to `next`, PyPI gets it as a pre-release (`X.Y.ZrcN`, which pip installs
+only when asked), and the image gets its exact tag and no other. A stable crate
 version is not published from it. The Homebrew tap, the MCP registry and the
 site are left alone. `docs/versioning.md` lists what every surface does with
 one.
+
+A fix to the Python package alone doesn't need an engine release. Once it's on
+`main`, run `python.yml` by hand with the release tag and a post number, and
+it publishes `X.Y.Z.postN` with the same binaries.
+
+PyPI trusts `python.yml` through Trusted Publishing, set up once on PyPI for
+this repository, the `python.yml` workflow and the `pypi` environment. The
+`pypi` environment in the repository settings allows deployments from `main`
+only, so a run from any other branch can't publish, and it needs a
+maintainer's approval. `python.yml` runs as its own workflow, so a release
+asks twice: once at the release's gate, and again when its PyPI publish is
+ready.
 
 ## Verifying a release
 
@@ -53,6 +67,9 @@ one.
 - **npm packages** are published with OIDC-backed provenance attestations.
   Provenance on npmjs.com confirms the package was built from this
   repository at the expected tag via GitHub Actions.
+- **PyPI** is published through Trusted Publishing, with attestations that
+  PyPI shows on each file. The wheels carry the release's own binaries,
+  checked against `sha256sums.txt` before they're packaged.
 - **crates.io** is published by the same pipeline under the same tag, so
   `docs.rs`, the GitHub Release binaries, and the npm packages all
   correspond to a single commit. The crates.io step is skipped when the crate
@@ -86,6 +103,7 @@ Public workflows a contributor may see when opening a PR:
 | `ci.yml` | Pull request, manual | Build, test, and lint. Required for merge. |
 | `benchmark-regression.yml` | Pull request | Runs Criterion and iai-callgrind benchmarks and posts a comparison comment. Wall-clock numbers are advisory because shared runners are noisy. iai-callgrind instruction counts are nearly deterministic: the job benchmarks the base branch on the same runner and goes red if a benchmark runs more than 4% more instructions. It isn't a required check. |
 | `release.yml` | `v*` tag push | Primary release pipeline. Runs only on releases; contributors should not see it fire on PRs. |
+| `python.yml` | Pull request touching `python/`, manual | On a PR, builds the Python wheels from the release the package is written for and installs each on its own platform. It publishes to PyPI only when a release dispatches it, or a maintainer runs it by hand. |
 
 Additional workflows in `.github/workflows/` (`benchmark-refresh.yml`,
 `release-preflight.yml`, `test-build.yml`, `publish-crate.yml`,

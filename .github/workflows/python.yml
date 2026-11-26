@@ -1,0 +1,286 @@
+name: Publish to PyPI
+# Builds the dynoxide Python package for a release tag and publishes it to
+# PyPI. release.yml dispatches it for every release; it can also be run by
+# hand for an existing tag, which is how a fix to the Python package alone
+# goes out (as X.Y.Z.postN, with the post input).
+#
+# The package code comes from the ref this workflow runs on, normally main,
+# not from the tag: the tag supplies only the release's binaries. A tag cut
+# before python/ existed, such as v1.8.0, has no package code in its tree.
+#
+# On a pull request that touches the package it builds and smoke-tests the
+# wheels against the release python/ was written for, and publishes nothing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag whose binaries to package (e.g. v1.8.0)"
+        required: true
+        type: string
+      post:
+        description: "Post-release number for a Python-only fix (1 gives X.Y.Z.post1). Empty for the release itself."
+        required: false
+        type: string
+        default: ""
+      publish:
+        description: "Publish to PyPI. Off for a dry run that builds and smoke-tests only."
+        required: false
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - "python/**"
+      - ".github/workflows/python.yml"
+      - "scripts/pypi-version.sh"
+      - "scripts/is-semver.sh"
+
+concurrency:
+  group: pypi-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    name: Work out the version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      engine: ${{ steps.version.outputs.engine }}
+      version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.version.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Map the tag to a PyPI version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_POST: ${{ inputs.post }}
+        run: |
+          set -euo pipefail
+          PACKAGE_ENGINE=$(sed -n 's/^ENGINE_VERSION = "\(.*\)"$/\1/p' python/src/dynoxide/_version.py)
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+            POST="$INPUT_POST"
+          else
+            TAG="v$PACKAGE_ENGINE"
+            POST=""
+          fi
+          ENGINE="${TAG#v}"
+          if [ "$ENGINE" = "$TAG" ] || ! scripts/is-semver.sh "$ENGINE"; then
+            echo "::error::Invalid tag format: $TAG (expected vX.Y.Z or vX.Y.Z-pre.N)"
+            exit 1
+          fi
+          # The package on this ref must be the one written for this
+          # release, or its code and the binaries could disagree about the
+          # launcher contract.
+          if [ "$PACKAGE_ENGINE" != "$ENGINE" ]; then
+            echo "::error::python/src/dynoxide/_version.py on $GITHUB_REF is for $PACKAGE_ENGINE, not $ENGINE. Run this from a ref whose package matches the tag."
+            exit 1
+          fi
+          SKIP=false
+          if ! VERSION=$(scripts/pypi-version.sh "$ENGINE" "$POST"); then
+            # The tag is already known to be semver, so with no post number
+            # this is a prerelease PyPI can't express, which skips PyPI.
+            if [ -n "$POST" ]; then exit 1; fi
+            echo "::notice::$ENGINE has no PyPI version form, so there is nothing to build or publish."
+            SKIP=true
+          elif [ "$GITHUB_EVENT_NAME" = "pull_request" ] && ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            # A release pull request bumps the package before its release
+            # exists, so there are no binaries to build from yet. The publish
+            # run after the release does the full build.
+            echo "::notice::Release $TAG isn't published yet, so the wheels can't be built on this pull request."
+            SKIP=true
+          fi
+          {
+            echo "tag=$TAG"
+            echo "engine=$ENGINE"
+            echo "version=$VERSION"
+            echo "skip=$SKIP"
+          } >> "$GITHUB_OUTPUT"
+          [ "$SKIP" = true ] || echo "Packaging $TAG as dynoxide $VERSION on PyPI"
+
+  build:
+    name: Build the wheels
+    needs: version
+    if: needs.version.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Stamp the package version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          sed -i "s/^__version__ = \".*\"$/__version__ = \"$VERSION\"/" python/src/dynoxide/_version.py
+          grep -qx "__version__ = \"$VERSION\"" python/src/dynoxide/_version.py
+
+      - name: Build the code and the sdist
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build python --outdir build-out
+
+      - name: Download the release's binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets --pattern 'dynoxide-*' --pattern sha256sums.txt
+
+      - name: Repack them into platform wheels
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir dist
+          python python/scripts/build_wheels.py --pure "build-out/dynoxide-$VERSION-py3-none-any.whl" --assets assets --out dist
+          cp "build-out/dynoxide-$VERSION.tar.gz" dist/
+          ls -l dist
+          test "$(find dist -name '*.whl' | wc -l)" -eq 5
+          python -m twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: python-dist
+          path: dist/
+          if-no-files-found: error
+
+  # Each wheel installed where it's meant to run, without the network, and
+  # used: start, a write and a read through boto3, stop. Alpine proves the
+  # musllinux tag on the same wheel as the glibc leg.
+  smoke:
+    name: Smoke test (${{ matrix.name }})
+    needs: [version, build]
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: alpine-x86_64, os: ubuntu-latest, container: "python:3.13-alpine" }
+          - { name: macos-arm64, os: macos-latest }
+          - { name: macos-x86_64, os: macos-15-intel }
+          - { name: windows-x86_64, os: windows-latest }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install bash in the container
+        if: ${{ matrix.container }}
+        shell: sh
+        run: apk add --no-cache bash
+
+      - uses: actions/setup-python@v6
+        if: ${{ !matrix.container }}
+        with:
+          python-version: "3.13"
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Install the wheel
+        run: |
+          python -m venv venv
+          if [ -x venv/Scripts/python.exe ]; then PY=venv/Scripts/python.exe; else PY=venv/bin/python; fi
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          "$PY" -m pip install --no-index --find-links dist dynoxide
+          "$PY" -m pip install boto3
+
+      - name: Start it and use it
+        env:
+          ENGINE: ${{ needs.version.outputs.engine }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          "$PY" - <<'EOF'
+          import os, subprocess, boto3, dynoxide
+          from importlib.metadata import version
+          assert version("dynoxide") == os.environ["VERSION"], version("dynoxide")
+          out = subprocess.run([dynoxide.binary_path(), "--version"], capture_output=True, text=True).stdout.strip()
+          assert out == f"dynoxide {os.environ['ENGINE']}", out
+          with dynoxide.start() as server:
+              assert server.binary_source == "package"
+              client = boto3.client("dynamodb", **server.client_kwargs())
+              client.create_table(
+                  TableName="Smoke",
+                  KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+                  AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                  BillingMode="PAY_PER_REQUEST",
+              )
+              client.put_item(TableName="Smoke", Item={"pk": {"S": "a"}})
+              assert client.get_item(TableName="Smoke", Key={"pk": {"S": "a"}})["Item"]["pk"]["S"] == "a"
+          assert server.stop() == 0
+          print("ok:", out, server.endpoint)
+          EOF
+          if [ -x venv/Scripts/dynoxide.exe ]; then venv/Scripts/dynoxide.exe --version; else venv/bin/dynoxide --version; fi
+
+  # From source there's no binary, so start() has to say so rather than fail
+  # somewhere less clear.
+  smoke-sdist:
+    name: Smoke test (sdist)
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/download-artifact@v7
+        with:
+          name: python-dist
+          path: dist
+      - name: Install from source and check the error
+        run: |
+          python -m venv venv
+          venv/bin/python -m pip install dist/dynoxide-*.tar.gz
+          venv/bin/python - <<'EOF'
+          import dynoxide
+          try:
+              dynoxide.start()
+          except dynoxide.DynoxideError as err:
+              assert err.code == "UNSUPPORTED_PLATFORM", err.code
+              print("ok:", err)
+          else:
+              raise SystemExit("start() worked without a binary")
+          EOF
+
+  publish:
+    name: Publish to PyPI
+    needs: [version, build, smoke, smoke-sdist]
+    # Only from main, so a branch can't publish by accident. The pypi
+    # environment's branch rule is what enforces it.
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/dynoxide/${{ needs.version.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: python-dist
+          path: dist
+
+      # Trusted Publishing: PyPI trusts this workflow and environment, so no
+      # token is stored. Attestations are on by default. skip-existing makes
+      # a re-run upload only the files PyPI doesn't have yet, which finishes
+      # a release whose upload stopped part way. A file already there can't
+      # be replaced, so a wrong one needs a post-release.
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          skip-existing: true

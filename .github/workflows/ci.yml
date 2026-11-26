@@ -282,6 +282,12 @@ jobs:
       - name: Check the changed-paths gate still runs code changes
         run: scripts/ci-changed-paths.test.sh
 
+      # The npm and Python jobs each finish with a check that every leg ran
+      # its tests cleanly. A check that always passes would hide a leg that
+      # never ran, so its verdicts are pinned here.
+      - name: Check the every-leg-ran check can still fail
+        run: scripts/check-npm-legs.test.sh
+
       # The Trusted Publishing probe passes by reading a refusal from
       # crates.io, which is easy to get wrong in the direction that always
       # says yes. Every answer crates.io can give is replayed against it here,
@@ -690,6 +696,96 @@ jobs:
           path: legs
       - name: Check each leg
         run: scripts/check-npm-legs.sh legs Linux-node18.x macOS-node18.x Windows-node18.x Linux-node24
+
+  # The Python package's start() and pytest plugin, against a binary built
+  # here. 3.10 is the oldest Python the package supports and 3.15 the newest.
+  # Windows skips four tests: two need fork, one SIGTERM, and one a shell
+  # script on PATH. The Linux 3.15 leg also lints and type-checks the package.
+  python:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    name: Python (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.15"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the binary
+        run: cargo build --release
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      # --group needs pip 25.1 or later, newer than some runners' default.
+      - name: Install the package and its test tools
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . --group dev
+
+      - name: Lint and type-check
+        if: runner.os == 'Linux' && matrix.python == '3.15'
+        working-directory: python
+        run: |
+          ruff check .
+          ruff format --check .
+          mypy
+
+      - name: Test
+        working-directory: python
+        env:
+          DYNOXIDE_BINARY: ${{ github.workspace }}/target/release/dynoxide${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: python -m pytest -rs --junitxml="$RUNNER_TEMP/junit.xml"
+
+      - name: Record the leg
+        env:
+          EXPECTED_SKIPS: ${{ runner.os == 'Windows' && 4 || 0 }}
+        run: |
+          mkdir leg
+          python - "$RUNNER_TEMP/junit.xml" > leg/leg.txt <<'EOF'
+          import os, sys, xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          get = lambda name: int(suite.get(name, 0))
+          print(f"expected_skips={os.environ['EXPECTED_SKIPS']}")
+          print(f"# tests {get('tests')}")
+          print(f"# fail {get('failures') + get('errors')}")
+          print(f"# skipped {get('skipped')}")
+          EOF
+          cat leg/leg.txt
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: python-leg-${{ runner.os }}-${{ matrix.python }}
+          path: leg/leg.txt
+
+  python-legs:
+    name: Python every leg ran
+    needs: [changes, python]
+    if: always() && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: python-leg-*
+          path: legs
+      - name: Check each leg
+        env:
+          LEG_PREFIX: python-leg-
+        run: scripts/check-npm-legs.sh legs Linux-3.10 Linux-3.15 macOS-3.10 macOS-3.15 Windows-3.10 Windows-3.15
 
   # Decides which jobs this PR needs, from its changed files. `docker` gates the
   # Docker smoke test on the paths that can break the documented MCP-in-Docker

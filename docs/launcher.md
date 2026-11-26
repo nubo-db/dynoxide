@@ -10,10 +10,13 @@ endpoint and stop it again, including when the test runner is killed. This
 page says how, so every wrapper gets those details right in the same way and a
 developer moving between languages sees the same behaviour.
 
-The npm package's `start()` and the Composer package `nubo-db/dynoxide` for
-PHP implement it. The npm package takes its binary from its platform package,
-so it has no cache or download step, and it refuses a binary older than 1.7.0
-(`DYNOXIDE_TOO_OLD`) instead of falling back to the stderr line.
+The npm package's `start()`, the Composer package `nubo-db/dynoxide` for PHP
+and the PyPI package `dynoxide` for Python implement it. The npm package takes
+its binary from its platform package, so it has no cache or download step, and
+it refuses a binary older than 1.7.0 (`DYNOXIDE_TOO_OLD`) instead of falling
+back to the stderr line. The Python package ships the binary inside its
+platform wheels, so it has no cache or download step either, and like PHP it
+starts a 1.6.x binary the older way.
 
 Changes are listed at the end of this page, and feedback is welcome as an issue
 on the repository. `docs/versioning.md` covers what the engine itself promises.
@@ -254,8 +257,10 @@ the server's next write blocks and requests stall with no error.
 
 A single-threaded runtime such as PHP can't read in the background while the
 tests run, so it sends both streams to files and polls the stdout file for the
-ready line. Keep the last few lines of stderr either way: they belong in any
-startup error.
+ready line. Python does the same for a different reason: a reader thread makes
+Python 3.12 and later warn on every `fork()` while the server runs, which fails
+a test suite that turns warnings into errors. Keep the last few lines of stderr
+either way: they belong in any startup error.
 
 ## Knowing it's ready
 
@@ -514,7 +519,7 @@ Fixed, so wrappers behave alike:
 - [ ] Extraction takes the one expected file and rejects anything else.
 - [ ] The server is spawned with an argument array, no shell, no shim, and no
       `--host`.
-- [ ] stdout and stderr are read for the life of the process.
+- [ ] stdout and stderr are read for the life of the process, or sent to files.
 - [ ] Readiness comes from the first stdout line, with a timeout that fails.
 - [ ] Start returns the endpoint, region and the `dynoxide` credentials.
 - [ ] Exporting is a separate call, sets both region variables and

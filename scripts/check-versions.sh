@@ -63,6 +63,26 @@ check_json() {
 check_json mcpb/manifest.json '.version' "bundle version" "$PRODUCT"
 check_json npm/wasm-engine/package.json '.version' "package version" "$PRODUCT"
 
+# The Python package carries the engine version it was built for, and its own
+# version in PEP 440 form. A post-release such as 1.8.0.post1 is stamped by
+# the publishing workflow and never committed, so the committed value is the
+# plain mapping. A prerelease with no PEP 440 form doesn't go to PyPI, so
+# only the engine version is checked for one.
+PY_VERSION_FILE=python/src/dynoxide/_version.py
+if [ -f "$PY_VERSION_FILE" ]; then
+  py_field() { sed -n "s/^$1 = \"\\(.*\\)\"\$/\\1/p" "$PY_VERSION_FILE" | head -1; }
+  PY_ENGINE="$(py_field ENGINE_VERSION)"
+  PY_PACKAGE="$(py_field __version__)"
+  [ "$PY_ENGINE" = "$PRODUCT" ] || fail "ENGINE_VERSION in $PY_VERSION_FILE is '$PY_ENGINE', expected '$PRODUCT'"
+  if [ -n "$PRODUCT" ] && WANT_PY="$("$SCRIPT_DIR/pypi-version.sh" "$PRODUCT" 2>/dev/null)"; then
+    [ "$PY_PACKAGE" = "$WANT_PY" ] || fail "__version__ in $PY_VERSION_FILE is '$PY_PACKAGE', expected '$WANT_PY'"
+  else
+    echo "note: $PRODUCT has no PyPI form, so __version__ in $PY_VERSION_FILE isn't checked" >&2
+  fi
+else
+  fail "$PY_VERSION_FILE is missing"
+fi
+
 # The crate lockfile has to agree with the crate, or a publish goes out against
 # a stale lock. benchmarks/Cargo.lock is an unpublished dev package and is not
 # part of this.

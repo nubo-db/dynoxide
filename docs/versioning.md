@@ -3,7 +3,7 @@
 Dynoxide has two version streams.
 
 The **product version** covers everything you install: the `dynoxide` CLI and
-its platform binaries, the npm packages, the browser engine, the container
+its platform binaries, the npm packages, the PyPI package, the browser engine, the container
 images, the MCPB bundle, the MCP registry entry, the GitHub Action and the
 Homebrew formula. It lives in the `VERSION` file at the repository root, and
 the release tag carries it. `dynoxide --version`, the `x-dynoxide-version` and
@@ -201,6 +201,7 @@ the alternative is a new major every few weeks.
 If you would rather behaviour held still:
 
 - **npm:** `~1.2.0` accepts patches only.
+- **pip:** `dynoxide~=1.2.0` accepts patches and post-releases only.
 - **Containers:** `dynoxide:1.2` is pinned to the minor. `dynoxide:1` floats
   across the whole major line and does receive conformance fixes.
 - **Cargo:** `=2.0.0`, or rely on your lockfile. That pins the crate, which is
@@ -214,6 +215,10 @@ range, ask for it explicitly.
 The number in `dynoxide --version` is the product version. So is the image tag,
 the npm version and the Action tag. If you are reporting a bug, that is the
 number to give.
+
+PyPI writes it the PEP 440 way: `1.3.0-rc.1` is `1.3.0rc1` there. A fix to the
+Python package alone ships as a post-release, such as `1.2.0.post1`, with the
+same binaries as `1.2.0`.
 
 `cargo install dynoxide-rs --version X` selects the **crate** version, and the
 binary it produces still reports the product version. They are different
@@ -234,6 +239,7 @@ channel.
 | GitHub Release | Published, and flagged as a prerelease, so it never becomes the Latest release |
 | GitHub Action | `version: latest` keeps downloading the Latest release; ask for `version: v1.3.0-rc.1` to get the rc |
 | npm | Published to the `next` dist-tag: `npm install dynoxide@next`, or the exact version |
+| PyPI | Published as a pre-release (`1.3.0rc1`), which pip installs only with `--pre` or the exact version. An alpha, beta or rc is the only prerelease shape PyPI can express; any other skips PyPI |
 | Containers | Tagged with the exact version only; `latest`, `1` and `1.3` stay on the last stable release |
 | crates.io | Published only when the crate version is a prerelease too; a stable crate version waits for the stable release |
 | Homebrew | Not published. The tap holds one formula, so an rc there would reach everyone on their next `brew upgrade` |

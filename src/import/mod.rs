@@ -151,7 +151,19 @@ pub fn scaffold_from_schema(db: &Database, path: &std::path::Path) -> Result<usi
         let create_request = build_create_request(&schema_json, &table_schema.table_name)?;
         match db.create_table(create_request) {
             Ok(_) => created += 1,
-            Err(crate::errors::DynoxideError::ResourceInUseException(_)) => {} // already exists
+            // Already there, so nothing to scaffold. CreateTable also refuses a
+            // name SQLite can't store beside another (`users` beside `Users`)
+            // this way, and that table isn't there: report it.
+            Err(crate::errors::DynoxideError::ResourceInUseException(message)) => {
+                let exists = db
+                    .describe_table(crate::actions::describe_table::DescribeTableRequest {
+                        table_name: table_schema.table_name.clone(),
+                    })
+                    .is_ok();
+                if !exists {
+                    return Err(ImportError::Database(message));
+                }
+            }
             Err(e) => return Err(ImportError::Database(e.to_string())),
         }
     }

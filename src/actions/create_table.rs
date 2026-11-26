@@ -625,10 +625,13 @@ fn validate_vector_index_list(
         )?;
     }
 
-    // Duplicate index names within the vector list.
+    // Duplicate index names within the vector list,
+    // ignoring case: each index is stored in an SQLite table named after it,
+    // and SQLite compares table names ignoring case, so `byG` and `BYG` would
+    // share one. DynamoDB itself treats them as different indexes.
     let mut seen = std::collections::HashSet::new();
     for vix in vixs {
-        if !seen.insert(&vix.index_name) {
+        if !seen.insert(vix.index_name.to_ascii_lowercase()) {
             return Err(ve(format!(
                 "One or more parameter values were invalid: Duplicate index name: {}",
                 vix.index_name
@@ -1536,10 +1539,10 @@ fn validate_lsi_list(
         validate_lsi_structure(lsi, ks)?;
     }
 
-    // Duplicate index names
+    // Duplicate index names, ignoring case (see `validate_gsi_list`)
     let mut seen = std::collections::HashSet::new();
     for lsi in lsis {
-        if !seen.insert(&lsi.index_name) {
+        if !seen.insert(lsi.index_name.to_ascii_lowercase()) {
             return Err(format!(
                 "One or more parameter values were invalid: Duplicate index name: {}",
                 lsi.index_name
@@ -1574,10 +1577,13 @@ fn validate_gsi_list(
         validate_gsi_structure(gsi)?;
     }
 
-    // Duplicate index names
+    // Duplicate index names,
+    // ignoring case: each index is stored in an SQLite table named after it,
+    // and SQLite compares table names ignoring case, so `byG` and `BYG` would
+    // share one. DynamoDB itself treats them as different indexes.
     let mut seen = std::collections::HashSet::new();
     for gsi in gsis {
-        if !seen.insert(&gsi.index_name) {
+        if !seen.insert(gsi.index_name.to_ascii_lowercase()) {
             return Err(format!(
                 "One or more parameter values were invalid: Duplicate index name: {}",
                 gsi.index_name

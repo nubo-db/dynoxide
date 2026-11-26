@@ -581,6 +581,25 @@ fields = ["email"]
     }
 
     #[test]
+    fn test_scaffold_reports_a_table_it_cannot_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema_file = tmp.path().join("schema.json");
+        // SQLite compares table names ignoring case, so `users` can't be
+        // stored beside `Users`: scaffolding must say so, not skip it.
+        create_schema_file(
+            &schema_file,
+            &[simple_table_schema("Users"), simple_table_schema("users")],
+        );
+
+        let db = dynoxide::Database::memory().unwrap();
+        let error = import::scaffold_from_schema(&db, &schema_file).unwrap_err();
+        assert!(
+            error.to_string().contains("Table already exists: users"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn test_scaffold_with_gsi() {
         let tmp = tempfile::tempdir().unwrap();
         let schema_file = tmp.path().join("schema.json");

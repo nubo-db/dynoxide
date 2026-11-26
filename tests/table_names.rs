@@ -140,12 +140,12 @@ fn dynoxides_own_table_names_are_refused_and_leave_nothing_behind() {
 }
 
 #[test]
-fn a_create_that_fails_at_an_index_leaves_no_table() {
+fn a_refused_create_with_indexes_a_stream_and_tags_leaves_nothing_behind() {
     let db = Database::memory().unwrap();
     create_with_gsi(&db, "Users");
 
-    // `Users::gsi::byG` exists; creating `users` with a GSI of the same name
-    // clashes at the data table already, and must leave no index table either.
+    // `users` is refused before anything is written, so its GSI, stream and
+    // tags must not appear either, and `Users`'s own index must keep working.
     let req = json!({
         "TableName": "users",
         "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
@@ -321,4 +321,133 @@ fn a_create_that_fails_after_listing_the_table_leaves_nothing_behind() {
         )
         .unwrap();
     assert_eq!(data_table, 0);
+}
+
+fn vector(name: &str) -> Value {
+    json!({
+        "IndexName": name,
+        "VectorAttribute": {"AttributeName": "embedding"},
+        "Dimensions": 3,
+        "DistanceFunction": "COSINE",
+        "Projection": {"ProjectionType": "ALL"}
+    })
+}
+
+fn update(db: &Database, req: Value) -> Result<(), String> {
+    db.update_table(serde_json::from_value(req).unwrap())
+        .map(|_| ())
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// The SQLite tables whose names start `prefix`, compared exactly.
+fn sqlite_tables(path: &std::path::Path, prefix: &str) -> Vec<String> {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap();
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
+#[test]
+fn index_names_that_differ_only_in_case_are_refused_by_create_table() {
+    let db = Database::memory().unwrap();
+    let gsi = |name: &str| {
+        json!({
+            "IndexName": name,
+            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+            "Projection": {"ProjectionType": "ALL"}
+        })
+    };
+    let req = json!({
+        "TableName": "Two",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [
+            {"AttributeName": "pk", "AttributeType": "S"},
+            {"AttributeName": "g", "AttributeType": "S"}
+        ],
+        "GlobalSecondaryIndexes": [gsi("byG"), gsi("BYG")],
+        "BillingMode": "PAY_PER_REQUEST"
+    });
+    let error = format!(
+        "{:?}",
+        db.create_table(serde_json::from_value(req).unwrap())
+            .unwrap_err()
+    );
+    assert!(error.contains("ValidationException"), "{error}");
+    assert!(error.contains("Duplicate index name: BYG"), "{error}");
+
+    let req = json!({
+        "TableName": "Two",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "VectorIndexes": [vector("cos"), vector("COS")],
+        "BillingMode": "PAY_PER_REQUEST"
+    });
+    let error = format!(
+        "{:?}",
+        db.create_table(serde_json::from_value(req).unwrap())
+            .unwrap_err()
+    );
+    assert!(error.contains("Duplicate index name: COS"), "{error}");
+    assert!(tables(&db).is_empty());
+}
+
+#[test]
+fn adding_a_gsi_whose_name_differs_only_in_case_is_refused_and_keeps_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("index-case.db");
+    let db = Database::new(path.to_str().unwrap()).unwrap();
+    create_with_gsi(&db, "Users");
+    put(
+        &db,
+        "Users",
+        json!({"pk": {"S": "k"}, "g": {"S": "x"}, "v": {"S": "real"}}),
+    );
+
+    let error = update(
+        &db,
+        json!({
+            "TableName": "Users",
+            "AttributeDefinitions": [{"AttributeName": "g", "AttributeType": "S"}],
+            "GlobalSecondaryIndexUpdates": [{"Create": {
+                "IndexName": "BYG",
+                "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                "Projection": {"ProjectionType": "ALL"}
+            }}]
+        }),
+    )
+    .unwrap_err();
+    assert!(error.contains("Index already exists: BYG"), "{error}");
+    assert_eq!(query_g(&db, "Users"), 1);
+}
+
+#[test]
+fn adding_a_vector_index_whose_name_differs_only_in_case_keeps_the_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vector-case.db");
+    let db = Database::new(path.to_str().unwrap()).unwrap();
+    let req = json!({
+        "TableName": "Vec",
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+        "VectorIndexes": [vector("cos")],
+        "BillingMode": "PAY_PER_REQUEST"
+    });
+    db.create_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+    let error = update(
+        &db,
+        json!({"TableName": "Vec", "VectorIndexUpdates": [{"Create": vector("COS")}]}),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("Attempting to create an index which already exists"),
+        "{error}"
+    );
+    drop(db);
+    assert_eq!(sqlite_tables(&path, "Vec::"), ["Vec::vector::cos"]);
 }

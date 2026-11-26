@@ -67,6 +67,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release listed a table after refusing to create it, delete it: that is now
   safe and leaves the other table alone. DynamoDB accepts these names, and
   Dynoxide still refuses them.
+- **Two indexes of the same kind whose names differ only in case are
+  refused.** Each index is stored in an SQLite table named after it, so
+  `byG` and `BYG` would share one. CreateTable and UpdateTable now refuse the
+  second with `ValidationException` and the duplicate-index message. Adding a
+  vector index this way through UpdateTable used to succeed and delete the
+  first index's data; adding a GSI failed with `InternalServerError`.
+  DynamoDB accepts these names.
+- **Scaffolding from a schema file reports a table it can't create**, such as
+  `users` beside `Users`, instead of skipping it as one that already exists.
 
 ## [1.8.0] - 2026-11-20
 

@@ -50,6 +50,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `start()` function and a pytest plugin. It is published to PyPI from each
   release, starting with 1.8.0.
 
+### Fixed
+
+- **A refused CreateTable no longer leaves the table half-created, and
+  deleting one no longer drops another table's data.** Dynoxide stores each
+  table in an SQLite table of the same name, and SQLite compares table names
+  ignoring case. So CreateTable `users` beside an existing `Users`, a name
+  matching one of Dynoxide's own tables (`_tables`, `_config`,
+  `_stream_records`) in any case, or a name starting `sqlite_`, failed after
+  the table had already been listed. The listed table then read and wrote the
+  other table's items, and DeleteTable on it dropped the other table, or for
+  `_tables` the list of every table. CreateTable now refuses these names with
+  `ResourceInUseException` before writing anything, and makes a table in one
+  transaction, so a failure at any step leaves nothing behind. DeleteTable
+  drops only tables that belong to the table being deleted. If an earlier
+  release listed a table after refusing to create it, delete it: that is now
+  safe and leaves the other table alone. DynamoDB accepts these names, and
+  Dynoxide still refuses them.
+
 ## [1.8.0] - 2026-11-20
 
 The crate moves to `dynoxide-rs` 4.1.0. `server::bind` is new, and

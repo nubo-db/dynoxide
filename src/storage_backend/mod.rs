@@ -392,6 +392,10 @@ pub trait StorageBackend: private::Sealed {
     /// table before it unlists it, so a listed table can lack one.
     async fn data_table_exists(&self, table_name: &str) -> Result<bool, BackendError>;
 
+    /// Whether SQLite would refuse a data table named `table_name`: one exists
+    /// under that name ignoring case, or the name starts `sqlite_`.
+    async fn table_name_taken(&self, table_name: &str) -> Result<bool, BackendError>;
+
     // -----------------------------------------------------------------------
     // Dynamic data tables (DDL)
     // -----------------------------------------------------------------------

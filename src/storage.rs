@@ -752,6 +752,16 @@ impl Storage {
         table_exists(&self.conn, table_name)
     }
 
+    /// Whether SQLite would refuse a data table named `table_name` (see
+    /// `StorageBackend::table_name_taken`).
+    pub(crate) fn table_name_taken(&self, table_name: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(sql_builders::TABLE_NAME_TAKEN, [table_name], |row| {
+                row.get(0)
+            })?)
+    }
+
     /// The tables `_tables` lists whose data table is there. A table whose
     /// data table is missing is one an interrupted CreateTable or DeleteTable
     /// left behind, which neither runs in a transaction; the steps leave it

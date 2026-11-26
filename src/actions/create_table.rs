@@ -171,19 +171,8 @@ pub async fn execute<S: StorageBackend>(
         }
     }
 
-    // SQLite compares table names ignoring case and keeps some for itself,
-    // and each table is stored under its own name, so `users` beside `Users`,
-    // a case of one of Dynoxide's own tables, or a `sqlite_` name can't be
-    // stored. Refuse those here, before anything is written, as a table that
-    // already exists; DynamoDB itself would accept them.
-    if storage.table_exists(&request.table_name).await?
-        || storage.table_name_taken(&request.table_name).await?
-        || crate::storage_backend::sql_builders::is_reserved_table_name(&request.table_name)
-    {
-        return Err(DynoxideError::ResourceInUseException(format!(
-            "Table already exists: {}",
-            request.table_name
-        )));
+    if storage.table_exists(&request.table_name).await? {
+        return Err(table_already_exists(&request.table_name));
     }
 
     let now = SystemTime::now()
@@ -272,6 +261,19 @@ pub async fn execute<S: StorageBackend>(
     // Every write in one transaction, so a step that fails leaves nothing
     // behind: no listed table without its data table, no stray index table.
     let created = super::helpers::with_write_transaction(storage, async {
+        // Asked again under the write lock, so another process sharing the
+        // file can't take the name between the check and the writes. SQLite
+        // compares table names ignoring case and keeps some for itself, and
+        // each table is stored under its own name, so `users` beside `Users`,
+        // a case of one of Dynoxide's own tables, or a `sqlite_` name can't
+        // be stored either: refuse those as a table that already exists,
+        // though DynamoDB itself would accept them.
+        if storage.table_exists(&request.table_name).await?
+            || storage.table_name_taken(&request.table_name).await?
+            || crate::storage_backend::sql_builders::is_reserved_table_name(&request.table_name)
+        {
+            return Err(table_already_exists(&request.table_name));
+        }
         storage
             .insert_table_metadata(&crate::storage::CreateTableMetadata {
                 table_name: &request.table_name,
@@ -1371,6 +1373,10 @@ fn collect_proj_errors(
     {
         errors.push(format!("Value '[]' at '{}.projection.nonKeyAttributes' failed to satisfy constraint: Member must have length greater than or equal to 1", prefix));
     }
+}
+
+fn table_already_exists(table_name: &str) -> DynoxideError {
+    DynoxideError::ResourceInUseException(format!("Table already exists: {table_name}"))
 }
 
 // ---- Structural validation helpers ----

@@ -8657,3 +8657,67 @@ fn valid_calls_answer_as_the_http_api_does() {
     drop(child.stdin.take());
     let _ = child.wait();
 }
+
+#[test]
+fn the_shard_id_describe_stream_returns_reads_the_stream_through_mcp() {
+    let mut child = spawn_mcp();
+    init_mcp(&mut child);
+
+    let resp = call_tool(
+        &mut child,
+        1,
+        "create_table",
+        json!({
+            "table_name": "Evt",
+            "key_schema": [{"attribute_name": "pk", "key_type": "HASH"}],
+            "attribute_definitions": [{"attribute_name": "pk", "attribute_type": "S"}],
+            "stream_specification": {"stream_enabled": true, "stream_view_type": "NEW_IMAGE"}
+        }),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+    let resp = call_tool(
+        &mut child,
+        2,
+        "put_item",
+        json!({"table_name": "Evt", "item": {"pk": {"S": "a"}}}),
+    );
+    assert!(!is_tool_error(&resp), "{resp}");
+
+    let streams = tool_content(&call_tool(&mut child, 3, "list_streams", json!({})));
+    let arn = streams["Streams"][0]["StreamArn"].clone();
+    let described = tool_content(&call_tool(
+        &mut child,
+        4,
+        "describe_stream",
+        json!({"stream_arn": arn}),
+    ));
+    let shard_id = described["StreamDescription"]["Shards"][0]["ShardId"].clone();
+    assert_eq!(shard_id.as_str().map(str::len), Some(37), "{described}");
+
+    let iterator = tool_content(&call_tool(
+        &mut child,
+        5,
+        "get_shard_iterator",
+        json!({
+            "stream_arn": arn,
+            "shard_id": shard_id,
+            "shard_iterator_type": "TRIM_HORIZON"
+        }),
+    ));
+    let records = tool_content(&call_tool(
+        &mut child,
+        6,
+        "get_records",
+        json!({"shard_iterator": iterator["ShardIterator"]}),
+    ));
+    let keys: Vec<&Value> = records["Records"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{records}"))
+        .iter()
+        .map(|r| &r["dynamodb"]["Keys"]["pk"]["S"])
+        .collect();
+    assert_eq!(keys, [&json!("a")]);
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+}

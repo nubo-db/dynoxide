@@ -90,6 +90,7 @@ pub async fn execute<S: StorageBackend>(
 
     let label = meta.stream_label.clone().unwrap_or_default();
     let sid = streams::shard_id(&table_name);
+    let public_sid = streams::public_shard_id(&table_name, meta.stream_label.as_deref());
     let (start_seq, end_seq) = storage.get_shard_sequence_range(&table_name, &sid).await?;
     let public = |seq: Option<String>| {
         seq.and_then(|s| s.parse().ok())
@@ -107,7 +108,7 @@ pub async fn execute<S: StorageBackend>(
                 .unwrap_or_else(|| "NEW_AND_OLD_IMAGES".to_string()),
             table_name,
             shards: vec![Shard {
-                shard_id: sid,
+                shard_id: public_sid,
                 sequence_number_range: SequenceNumberRange {
                     starting_sequence_number: start_seq,
                     ending_sequence_number: end_seq,

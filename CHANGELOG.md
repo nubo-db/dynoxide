@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Behaviour changes
+
+- **Conformance fixes now ship as patch releases.** A fix that brings an
+  answer closer to DynamoDB's, backed by a recorded AWS observation, used to
+  take a minor. From 1.8.1 it takes a patch, so a minor pin such as `~1.8.0`
+  or `dynoxide:1.8` no longer holds behaviour still. Pin an exact version to
+  do that. [versioning.md](docs/versioning.md) has the details for each
+  package manager.
+- **DescribeStream returns a `ShardId` in DynamoDB's shape.** It's now
+  `shardId-`, the stream's creation time in milliseconds as 20 digits, `-` and
+  8 hex digits: 37 characters whatever the table's name, as DynamoDB returned
+  when captured against eu-west-2 on 26 November 2026. It used to be
+  `shardId-00000001-` followed by the table name, which boto3 and the PHP SDK
+  refuse before sending GetShardIterator when the name is under 11 characters,
+  and which ran past the 65 characters DynamoDB's API allows when the name was
+  over 48. A stream keeps its ID across restarts, and a new stream on the same
+  table, after disabling and re-enabling it or recreating the table, gets a
+  new one. GetShardIterator still accepts the old form, and shard iterators
+  from earlier releases still read, so a consumer that kept either can still
+  read the stream. A consumer that tracks shards by ID, such as one built on
+  the Kinesis Client Library, sees the stream's shard change once on upgrade,
+  and reads it from where its settings start a new shard. Database files need
+  no upgrade.
+  ([#361](https://github.com/nubo-db/dynoxide/issues/361))
+- **GetShardIterator refuses a `ShardId` the stream doesn't have** with
+  `ResourceNotFoundException` and `Requested resource not found: Shard does
+  not exist`, as DynamoDB does. That includes the ID of an earlier stream on
+  the same table. It used to hand back an iterator that read nothing. Captured
+  against eu-west-2 on 26 November 2026.
+- **Enabling a stream that is already enabled is refused.** UpdateTable with
+  `StreamEnabled: true` on a table whose stream is on now fails with
+  `ValidationException` and `Table already has an enabled stream: TableName:
+  <name>`, whatever the view type, and leaves the stream alone. It used to
+  succeed and start a new stream, with a new ARN and `ShardId`, under any
+  consumer reading the old one. Disable the stream first to change its view
+  type, as on DynamoDB. Captured against eu-west-2 on 26 November 2026.
+
 ### Added
 
 - **A Python package.** `pip install dynoxide` installs Dynoxide with a
@@ -2866,7 +2903,8 @@ The wire API and the CLI, server and MCP surfaces are unaffected by all of these
 - HTTP server (axum-based, DynamoDB JSON wire protocol)
 - 300+ tests
 
-[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.7.0...HEAD
+[Unreleased]: https://github.com/nubo-db/dynoxide/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/nubo-db/dynoxide/compare/v1.7.0...v1.8.0
 [1.7.0]: https://github.com/nubo-db/dynoxide/compare/v1.6.0...v1.7.0
 [1.6.0]: https://github.com/nubo-db/dynoxide/compare/v1.5.0...v1.6.0
 [1.5.0]: https://github.com/nubo-db/dynoxide/compare/v1.4.0...v1.5.0

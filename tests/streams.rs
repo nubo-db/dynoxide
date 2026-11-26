@@ -567,7 +567,7 @@ fn shard_iterator(db: &Database, table: &str, kind: &str, seq: Option<&str>) -> 
     let arn = get_stream_arn(db, table);
     let mut req = json!({
         "StreamArn": &arn,
-        "ShardId": format!("shardId-00000001-{table}"),
+        "ShardId": described_shard_id(db, table),
         "ShardIteratorType": kind
     });
     if let Some(seq) = seq {
@@ -853,6 +853,7 @@ fn records_from_an_earlier_build_keep_their_ids_and_order_beside_new_ones() {
     assert_eq!(all_records(&db, "Evt")[1].event_id, "2");
 }
 
+// Uses the shard ID form 1.8.0 returned, which GetShardIterator still accepts.
 fn shard_iterator_error(db: &Database, kind: &str, seq: Option<&str>) -> String {
     let mut req = json!({
         "StreamArn": get_stream_arn(db, "Evt"),
@@ -924,4 +925,389 @@ fn a_sequence_number_on_trim_horizon_or_latest_is_refused() {
              SequenceNumber should not be passed for this iterator type"
         );
     }
+}
+
+// ------------------------------------------------------------------
+// Shard IDs
+// ------------------------------------------------------------------
+
+fn described_shard_id(db: &Database, table: &str) -> String {
+    let req = json!({"StreamArn": get_stream_arn(db, table)});
+    let resp = db
+        .describe_stream(serde_json::from_value(req).unwrap())
+        .unwrap();
+    resp.stream_description.shards[0].shard_id.clone()
+}
+
+fn iterator_for(db: &Database, table: &str, shard_id: &str, kind: &str) -> String {
+    let req = json!({
+        "StreamArn": get_stream_arn(db, table),
+        "ShardId": shard_id,
+        "ShardIteratorType": kind
+    });
+    db.get_shard_iterator(serde_json::from_value(req).unwrap())
+        .unwrap()
+        .shard_iterator
+        .unwrap()
+}
+
+fn event_names(db: &Database, iterator: &str) -> Vec<String> {
+    get_records(db, iterator)
+        .records
+        .into_iter()
+        .map(|r| r.event_name)
+        .collect()
+}
+
+fn set_stream(db: &Database, table: &str, enabled: bool) {
+    let spec = if enabled {
+        json!({"StreamEnabled": true, "StreamViewType": "NEW_AND_OLD_IMAGES"})
+    } else {
+        json!({"StreamEnabled": false})
+    };
+    let req = json!({"TableName": table, "StreamSpecification": spec});
+    db.update_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+}
+
+/// DynamoDB's shard IDs are `shardId-`, 20 digits, `-` and 8 hex digits, and
+/// its API model allows 28 to 65 characters, which SDKs check.
+fn assert_aws_shard_id(id: &str) {
+    assert_eq!(id.len(), 37, "shard ID {id} should be 37 characters");
+    let rest = id
+        .strip_prefix("shardId-")
+        .unwrap_or_else(|| panic!("{id}"));
+    let (digits, hex) = rest.split_at(20);
+    assert!(digits.chars().all(|c| c.is_ascii_digit()), "{id}");
+    let hex = hex.strip_prefix('-').unwrap_or_else(|| panic!("{id}"));
+    assert!(
+        hex.len() == 8 && hex.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "{id}"
+    );
+}
+
+#[test]
+fn shard_ids_are_aws_shaped_whatever_the_table_name() {
+    let db = Database::memory().unwrap();
+    let mut ids = std::collections::HashSet::new();
+    for len in [3, 10, 11, 48, 49, 255] {
+        let name = "t".repeat(len);
+        create_stream_table(&db, &name, "NEW_IMAGE");
+        let id = described_shard_id(&db, &name);
+        assert_aws_shard_id(&id);
+        ids.insert(id);
+    }
+    assert_eq!(ids.len(), 6, "each table's stream should have its own ID");
+}
+
+#[test]
+fn a_shard_id_carries_the_stream_creation_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.db");
+    let path = path.to_str().unwrap();
+    {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+    }
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch(
+            "UPDATE _tables SET stream_label = '1700000000.123456789' WHERE table_name = 'Evt'",
+        )
+        .unwrap();
+    let db = Database::new(path).unwrap();
+    let id = described_shard_id(&db, "Evt");
+    assert_aws_shard_id(&id);
+    // The digits are the label's milliseconds. The ID must not change across
+    // an upgrade, so the whole value is pinned, hash included.
+    assert_eq!(id, "shardId-00000001700000000123-19f27ce2");
+}
+
+#[test]
+fn the_described_shard_id_reads_the_stream() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_AND_OLD_IMAGES");
+    put_item(&db, "Evt", "a", "1");
+    put_item(&db, "Evt", "a", "2");
+    delete_item(&db, "Evt", "a");
+
+    let id = described_shard_id(&db, "Evt");
+    let names = event_names(&db, &iterator_for(&db, "Evt", &id, "TRIM_HORIZON"));
+    assert_eq!(names, ["INSERT", "MODIFY", "REMOVE"]);
+}
+
+#[test]
+fn the_shard_id_form_from_earlier_releases_still_reads_the_stream() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "a", "1");
+    put_item(&db, "Evt", "b", "2");
+
+    let new_form = iterator_for(&db, "Evt", &described_shard_id(&db, "Evt"), "TRIM_HORIZON");
+    let old_form = iterator_for(&db, "Evt", "shardId-00000001-Evt", "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &old_form)), ["a", "b"]);
+    assert_eq!(
+        record_keys(&get_records(&db, &old_form)),
+        record_keys(&get_records(&db, &new_form))
+    );
+}
+
+#[test]
+fn latest_with_the_described_shard_id_starts_after_the_last_record() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "before", "1");
+
+    let id = described_shard_id(&db, "Evt");
+    let latest = iterator_for(&db, "Evt", &id, "LATEST");
+    put_item(&db, "Evt", "after", "2");
+    assert_eq!(record_keys(&get_records(&db, &latest)), ["after"]);
+}
+
+#[test]
+fn a_shard_id_stays_the_same_for_the_same_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.db");
+    let path = path.to_str().unwrap();
+    let id = {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+        let id = described_shard_id(&db, "Evt");
+        assert_eq!(described_shard_id(&db, "Evt"), id);
+        id
+    };
+    let db = Database::new(path).unwrap();
+    assert_eq!(described_shard_id(&db, "Evt"), id);
+}
+
+#[test]
+fn a_new_stream_on_the_same_table_has_a_new_shard_id() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let first = described_shard_id(&db, "Evt");
+
+    set_stream(&db, "Evt", false);
+    set_stream(&db, "Evt", true);
+    let reenabled = described_shard_id(&db, "Evt");
+    assert_aws_shard_id(&reenabled);
+    assert_ne!(reenabled, first);
+
+    let req = json!({"TableName": "Evt"});
+    db.delete_table(serde_json::from_value(req).unwrap())
+        .unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let recreated = described_shard_id(&db, "Evt");
+    assert_ne!(recreated, first);
+    assert_ne!(recreated, reenabled);
+}
+
+fn shard_not_found(db: &Database, table: &str, shard_id: &str) -> String {
+    let req = json!({
+        "StreamArn": get_stream_arn(db, table),
+        "ShardId": shard_id,
+        "ShardIteratorType": "TRIM_HORIZON"
+    });
+    match db.get_shard_iterator(serde_json::from_value(req).unwrap()) {
+        Err(dynoxide::DynoxideError::ResourceNotFoundException(msg)) => msg,
+        other => panic!("{shard_id}: {other:?}"),
+    }
+}
+
+// DynamoDB answers a ShardId the stream doesn't have with this (eu-west-2,
+// 26 November 2026), for an ID it never had and for the previous stream's
+// shard asked for through the new stream's ARN.
+const SHARD_NOT_FOUND: &str = "Requested resource not found: Shard does not exist";
+
+#[test]
+fn a_shard_id_the_stream_never_had_is_refused() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "a", "1");
+    create_stream_table(&db, "Other", "NEW_IMAGE");
+    put_item(&db, "Other", "b", "1");
+
+    for id in [
+        "shardId-00000000000000000000-00000000".to_string(),
+        described_shard_id(&db, "Other"),
+        "shardId-00000001-Other".to_string(),
+    ] {
+        assert_eq!(shard_not_found(&db, "Evt", &id), SHARD_NOT_FOUND, "{id}");
+    }
+}
+
+#[test]
+fn an_invalid_request_is_refused_before_its_shard_id_is_looked_up() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let known = described_shard_id(&db, "Evt");
+    let error = |shard_id: &str, kind: &str| {
+        let req = json!({
+            "StreamArn": get_stream_arn(&db, "Evt"),
+            "ShardId": shard_id,
+            "ShardIteratorType": kind
+        });
+        format!(
+            "{:?}",
+            db.get_shard_iterator(serde_json::from_value(req).unwrap())
+                .unwrap_err()
+        )
+    };
+    // The answer for a bad request doesn't depend on whether the shard exists.
+    for kind in ["BOGUS", "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER"] {
+        let with_known = error(&known, kind);
+        assert!(with_known.contains("ValidationException"), "{with_known}");
+        assert_eq!(
+            error("shardId-00000000000000000000-00000000", kind),
+            with_known,
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn a_shard_id_from_an_earlier_stream_is_refused() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let old = described_shard_id(&db, "Evt");
+    set_stream(&db, "Evt", false);
+    set_stream(&db, "Evt", true);
+    put_item(&db, "Evt", "a", "1");
+
+    assert_eq!(shard_not_found(&db, "Evt", &old), SHARD_NOT_FOUND);
+    let current = iterator_for(&db, "Evt", &described_shard_id(&db, "Evt"), "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &current)), ["a"]);
+}
+
+#[test]
+fn a_database_file_keeps_its_stored_shard_ids_and_reads_through_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.db");
+    let path = path.to_str().unwrap();
+    {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+        put_item(&db, "Evt", "a", "1");
+        put_item(&db, "Evt", "b", "2");
+    }
+
+    // Records are stored under the shard ID earlier releases wrote, so a file
+    // from one of them needs no upgrade. One record carries the form imports
+    // used before 1.5.0.
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let stored: Vec<String> = conn
+        .prepare("SELECT DISTINCT shard_id FROM _stream_records")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(stored, ["shardId-00000001-Evt"]);
+    conn.execute_batch(
+        "UPDATE _stream_records SET shard_id = 'shardId-Evt-000000' \
+         WHERE CAST(sequence_number AS INTEGER) = \
+         (SELECT MAX(CAST(sequence_number AS INTEGER)) FROM _stream_records)",
+    )
+    .unwrap();
+    drop(conn);
+
+    let db = Database::new(path).unwrap();
+    let id = described_shard_id(&db, "Evt");
+    assert_aws_shard_id(&id);
+    let current = iterator_for(&db, "Evt", &id, "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &current)), ["a"]);
+    let legacy = iterator_for(&db, "Evt", "shardId-Evt-000000", "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &legacy)), ["b"]);
+}
+
+#[test]
+fn the_shard_id_form_from_earlier_releases_reads_an_empty_stream() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    let iterator = iterator_for(&db, "Evt", "shardId-00000001-Evt", "LATEST");
+    put_item(&db, "Evt", "a", "1");
+    assert_eq!(record_keys(&get_records(&db, &iterator)), ["a"]);
+}
+
+fn update_stream_error(db: &Database, table: &str, view_type: &str) -> String {
+    let req = json!({
+        "TableName": table,
+        "StreamSpecification": {"StreamEnabled": true, "StreamViewType": view_type}
+    });
+    match db.update_table(serde_json::from_value(req).unwrap()) {
+        Err(dynoxide::DynoxideError::ValidationException(msg)) => msg,
+        other => panic!("{view_type}: {other:?}"),
+    }
+}
+
+#[test]
+fn enabling_a_stream_that_is_already_enabled_is_refused() {
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_AND_OLD_IMAGES");
+    put_item(&db, "Evt", "a", "1");
+    let arn = get_stream_arn(&db, "Evt");
+    let id = described_shard_id(&db, "Evt");
+
+    // DynamoDB's answer for the same view type and for a different one
+    // (eu-west-2, 26 November 2026). The stream is left as it was.
+    for view_type in ["NEW_AND_OLD_IMAGES", "KEYS_ONLY"] {
+        assert_eq!(
+            update_stream_error(&db, "Evt", view_type),
+            "Table already has an enabled stream: TableName: Evt"
+        );
+    }
+    assert_eq!(get_stream_arn(&db, "Evt"), arn);
+    assert_eq!(described_shard_id(&db, "Evt"), id);
+    let req = json!({"StreamArn": arn});
+    let described = db
+        .describe_stream(serde_json::from_value(req).unwrap())
+        .unwrap();
+    assert_eq!(
+        described.stream_description.stream_view_type,
+        "NEW_AND_OLD_IMAGES"
+    );
+    let iterator = iterator_for(&db, "Evt", &id, "TRIM_HORIZON");
+    assert_eq!(record_keys(&get_records(&db, &iterator)), ["a"]);
+}
+
+#[test]
+fn a_table_without_a_stream_can_still_enable_one() {
+    let db = Database::memory().unwrap();
+    create_table_no_stream(&db, "Evt");
+    set_stream(&db, "Evt", true);
+    assert_aws_shard_id(&described_shard_id(&db, "Evt"));
+}
+
+#[test]
+fn a_shard_iterator_from_an_earlier_release_still_reads() {
+    use dynoxide::actions::get_shard_iterator::encode_shard_iterator;
+
+    let db = Database::memory().unwrap();
+    create_stream_table(&db, "Evt", "NEW_IMAGE");
+    put_item(&db, "Evt", "a", "1");
+    let iterator = encode_shard_iterator("Evt", "shardId-00000001-Evt", 0);
+    assert_eq!(record_keys(&get_records(&db, &iterator)), ["a"]);
+}
+
+#[test]
+fn a_stream_with_no_stored_label_still_gets_a_valid_shard_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("streams.db");
+    let path = path.to_str().unwrap();
+    {
+        let db = Database::new(path).unwrap();
+        create_stream_table(&db, "Evt", "NEW_IMAGE");
+    }
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("UPDATE _tables SET stream_label = NULL WHERE table_name = 'Evt'")
+        .unwrap();
+
+    let id = {
+        let db = Database::new(path).unwrap();
+        described_shard_id(&db, "Evt")
+    };
+    assert_aws_shard_id(&id);
+    assert!(id.starts_with("shardId-00000000000000000000-"), "{id}");
+    let db = Database::new(path).unwrap();
+    assert_eq!(described_shard_id(&db, "Evt"), id);
 }

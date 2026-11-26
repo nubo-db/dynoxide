@@ -23,9 +23,9 @@ serve, not just that the socket is open. `docs/versioning.md` names it as part
 of the CLI and wire contract, so it will not move inside 1.x, and
 `tests/container_contract.rs` holds it.
 
-Pin to `:1.2` rather than `:1` for a test fixture. Both float, but `:1` picks up
-conformance fixes, which change behaviour within the major on purpose. See
-[installation](installation.md) for the full tag semantics.
+Pin an exact tag such as `:1.8.1` for a test fixture. `:1.8` and `:1` both
+float and pick up conformance fixes, which change behaviour on purpose and ship
+as patches. See [installation](installation.md) for the full tag semantics.
 
 ## Recipes
 

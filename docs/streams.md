@@ -33,7 +33,7 @@ aws dynamodbstreams list-streams --endpoint-url http://localhost:8000
 # Describe a stream to get shard IDs
 aws dynamodbstreams describe-stream \
   --endpoint-url http://localhost:8000 \
-  --stream-arn arn:aws:dynamodb:local:000000000000:table/Events/stream/...
+  --stream-arn arn:aws:dynamodb:dynoxide:000000000000:table/Events/stream/...
 
 # Get a shard iterator and read records
 aws dynamodbstreams get-shard-iterator \
@@ -42,6 +42,19 @@ aws dynamodbstreams get-shard-iterator \
   --shard-id <shard-id> \
   --shard-iterator-type TRIM_HORIZON
 ```
+
+Each stream has one shard. Its ID has DynamoDB's shape, such as
+`shardId-00000001795697354493-ebb9c0b7`, and stays the same for the life of the
+stream. Releases before 1.8.1 returned `shardId-00000001-` followed by the table
+name, and GetShardIterator still accepts that form. Any other ID is refused with
+`ResourceNotFoundException`, as DynamoDB refuses it.
+
+To change a stream's view type, disable the stream and enable it again. Enabling
+a stream that is already enabled fails with `ValidationException`, as it does on
+DynamoDB, and the new stream has a new ARN and shard ID. Unlike on DynamoDB, the
+new stream also returns the records the earlier one held, and so does a stream
+on a table recreated with the same name
+([#363](https://github.com/nubo-db/dynoxide/issues/363)).
 
 ## Streams with import
 

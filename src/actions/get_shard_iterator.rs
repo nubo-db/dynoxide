@@ -20,7 +20,9 @@ pub struct GetShardIteratorResponse {
     pub shard_iterator: Option<String>,
 }
 
-/// Shard iterator is a base64-encoded JSON of `{table_name, shard_id, position}`.
+/// Shard iterator is a base64-encoded JSON of `{table_name, shard_id, position}`,
+/// where `shard_id` is the stored form from `streams::shard_id`, not the
+/// `ShardId` DescribeStream returns.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ShardIteratorData {
     table_name: String,
@@ -87,18 +89,15 @@ pub async fn execute<S: StorageBackend>(
         ));
     }
 
-    let position = match kind {
-        "TRIM_HORIZON" => 0,
-        "LATEST" => {
-            // Position at the shard's last record, so only later ones return.
-            let (_, last) = storage
-                .get_shard_sequence_range(&table_name, &request.shard_id)
-                .await?;
-            last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
-        }
+    // Validate the request before looking up its shard, so a malformed request
+    // gets the same answer whether or not the shard exists. `None` is LATEST,
+    // whose position needs the shard.
+    let requested_position = match kind {
+        "TRIM_HORIZON" => Some(0),
+        "LATEST" => None,
         // AT includes the named record, so position just before it.
-        "AT_SEQUENCE_NUMBER" => requested_sequence_number(&request)? - 1,
-        "AFTER_SEQUENCE_NUMBER" => requested_sequence_number(&request)?,
+        "AT_SEQUENCE_NUMBER" => Some(requested_sequence_number(&request)? - 1),
+        "AFTER_SEQUENCE_NUMBER" => Some(requested_sequence_number(&request)?),
         other => {
             return Err(DynoxideError::ValidationException(format!(
                 "Invalid ShardIteratorType: {other}"
@@ -106,7 +105,41 @@ pub async fn execute<S: StorageBackend>(
         }
     };
 
-    let iterator = encode_shard_iterator(&table_name, &request.shard_id, position);
+    // A ShardId the stream doesn't answer to is refused as DynamoDB refuses it
+    // (eu-west-2, 26 November 2026). Records an import wrote before 1.5.0, in
+    // the form `shardId-{table}-000000`, are still reachable by that ID.
+    let shard_id = match crate::streams::requested_shard_id(
+        &table_name,
+        meta.stream_label.as_deref(),
+        &request.shard_id,
+    ) {
+        Some(stored) => stored,
+        None => {
+            let (first, _) = storage
+                .get_shard_sequence_range(&table_name, &request.shard_id)
+                .await?;
+            if first.is_none() {
+                return Err(DynoxideError::ResourceNotFoundException(
+                    "Requested resource not found: Shard does not exist".to_string(),
+                ));
+            }
+            request.shard_id.clone()
+        }
+    };
+
+    let position = match requested_position {
+        Some(position) => position,
+        None => {
+            // LATEST: position at the shard's last record, so only later ones
+            // return.
+            let (_, last) = storage
+                .get_shard_sequence_range(&table_name, &shard_id)
+                .await?;
+            last.and_then(|seq| seq.parse().ok()).unwrap_or(0)
+        }
+    };
+
+    let iterator = encode_shard_iterator(&table_name, &shard_id, position);
 
     Ok(GetShardIteratorResponse {
         shard_iterator: Some(iterator),

@@ -15,8 +15,8 @@ lives in `Cargo.toml`.
 They were one number until 1.1.0. The split happened because a change to a
 public Rust type forced a major on every artefact whose users never touch the
 Rust API. Stranding everyone on `^1.x` and `dynoxide:1` to report a change
-they cannot observe is a poor trade. The current mapping is product **1.8.0**,
-crate **4.1.0**.
+they cannot observe is a poor trade. The current mapping is product **1.8.1**,
+crate **4.1.1**.
 
 This page says what each number promises. It is not a claim that conformance is
 finished.
@@ -98,7 +98,7 @@ reads one line instead of parsing the startup line. Once the listener is
 bound, the server prints a single JSON object to **stdout**:
 
 ```json
-{"event":"ready","schema":1,"version":"1.8.0","endpoint":"http://127.0.0.1:54321","host":"127.0.0.1","port":54321,"pid":4242}
+{"event":"ready","schema":1,"version":"1.8.1","endpoint":"http://127.0.0.1:54321","host":"127.0.0.1","port":54321,"pid":4242}
 ```
 
 With the flag, stdout carries this line and nothing else: tracing goes to
@@ -212,7 +212,7 @@ If you would rather behaviour held still:
 - **Containers:** `dynoxide:1.8.1` is exact. `dynoxide:1.8` floats across
   patches and `dynoxide:1` across the whole major line, and both receive
   conformance fixes.
-- **Cargo:** `=4.1.0`, or rely on your lockfile. That pins the crate, which is
+- **Cargo:** `=4.1.1`, or rely on your lockfile. That pins the crate, which is
   a different number from the product version the binary reports.
 
 `npm install dynoxide` writes a caret range for you. If you want an exact

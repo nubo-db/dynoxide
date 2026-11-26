@@ -55,7 +55,10 @@ it publishes `X.Y.Z.postN` with the same binaries.
 PyPI trusts `python.yml` through Trusted Publishing, set up once on PyPI for
 this repository, the `python.yml` workflow and the `pypi` environment. The
 `pypi` environment in the repository settings allows deployments from `main`
-only, so a run from any other branch can't publish.
+only, so a run from any other branch can't publish, and it needs a
+maintainer's approval. `python.yml` runs as its own workflow, so a release
+asks twice: once at the release's gate, and again when its PyPI publish is
+ready.
 
 ## Verifying a release
 

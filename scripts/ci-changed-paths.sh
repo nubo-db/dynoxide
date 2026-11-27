@@ -21,7 +21,7 @@
 # filter. Change both together.
 set -euo pipefail
 
-DOCS_ONLY='^(docs/|\.github/ISSUE_TEMPLATE/|\.github/PULL_REQUEST_TEMPLATE\.md$|(README|CONTRIBUTING|AGENTS|CHANGELOG|SECURITY|CODE_OF_CONDUCT)\.md$)'
+DOCS_ONLY='^(docs/|\.github/ISSUE_TEMPLATE/|\.github/PULL_REQUEST_TEMPLATE\.md$|(README|CONTRIBUTING|AGENTS|CHANGELOG|SECURITY|CODE_OF_CONDUCT|ROADMAP|SUPPORT)\.md$)'
 
 # Paths that can break the documented MCP-in-Docker recipe. src/main.rs carries
 # the serve and mcp flag plumbing and Cargo.{toml,lock} the feature set and rmcp

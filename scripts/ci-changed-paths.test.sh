@@ -34,6 +34,7 @@ expect() {
 expect false false "docs page" "docs/import.md"
 expect false false "nested docs page" "docs/rfcs/0001-example.md"
 expect false false "contributor docs" $'CONTRIBUTING.md\nAGENTS.md\nCHANGELOG.md'
+expect false false "roadmap and support pages" $'ROADMAP.md\nSUPPORT.md'
 expect false false "issue form and PR template" $'.github/ISSUE_TEMPLATE/community-integration.yml\n.github/PULL_REQUEST_TEMPLATE.md'
 expect true false "README also runs the Docker recipe" "README.md"
 expect false false "deleted docs page" "docs/old-page.md"

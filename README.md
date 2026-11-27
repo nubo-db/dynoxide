@@ -112,6 +112,7 @@ unchanged.
 - [Testcontainers](https://github.com/nubo-db/dynoxide/blob/main/docs/testcontainers.md) - driving the container from a test suite, and the wait strategy it needs
 - [Writing a launcher](https://github.com/nubo-db/dynoxide/blob/main/docs/launcher.md) - how a wrapper for another language finds, starts and stops the binary
 - [Laravel](https://github.com/nubo-db/dynoxide/blob/main/docs/laravel.md) - the DynamoDB cache, locks, sessions and failed jobs, run locally
+- [Bref](https://github.com/nubo-db/dynoxide/blob/main/docs/bref.md) - Laravel, Symfony and DynamoDB Streams handlers on Bref, run locally
 - [MCP server](https://github.com/nubo-db/dynoxide/blob/main/docs/mcp.md) - the Model Context Protocol server for coding agents
 - [DynamoDB Streams](https://github.com/nubo-db/dynoxide/blob/main/docs/streams.md) - enabling and reading stream records
 - [Import CLI](https://github.com/nubo-db/dynoxide/blob/main/docs/import.md) - loading data, table filtering, and anonymisation

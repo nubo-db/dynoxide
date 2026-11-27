@@ -16,6 +16,8 @@ on:
       - "CHANGELOG.md"
       - "SECURITY.md"
       - "CODE_OF_CONDUCT.md"
+      - "ROADMAP.md"
+      - "SUPPORT.md"
 
 permissions:
   contents: read

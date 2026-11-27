@@ -71,6 +71,17 @@ expect 1 "a stale pin from an earlier minor of this major is caught"
 fixture 2.3.0 3.0.0
 expect 0 "a clean tree at a later release passes"
 
+# An XML declaration's `version="1.0"` is the XML version, not a Dynoxide pin,
+# and PHPUnit configs in the docs start with one. The quoted-number branch of
+# the pattern would read it as a stale `1.0` once the product passed 1.0.
+fixture
+echo '<?xml version="1.0" encoding="UTF-8"?>' >> "$FIXTURE/docs/index.md"
+expect 0 "an XML declaration is not a pin"
+
+fixture
+echo '<parameter name="version" value="1.0"/>' >> "$FIXTURE/docs/index.md"
+expect 1 "a quoted stale version outside an XML declaration is still caught"
+
 fixture
 rm "$FIXTURE/npm/wasm-engine/README.md"
 expect 2 "a vanished input fails rather than reading clean"

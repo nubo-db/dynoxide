@@ -59,7 +59,8 @@ else
   PATTERN='\bpreview\b'
 fi
 
-ALLOW='## Upgrading to |is a breaking release'
+# An XML declaration's version is XML's own, not a Dynoxide pin.
+ALLOW='## Upgrading to |is a breaking release|^[^:]*:[0-9]+:<\?xml version='
 
 # A crate pin is not a product pin. `dynoxide-rs = "2.0"` is correct while the
 # product sits at 1.2, so those lines are held out of the product pass and

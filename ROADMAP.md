@@ -28,7 +28,8 @@ the `nubo-db/dynoxide-laravel` package.
 
 ## Next
 
-- **Guides for Symfony and Bref**, and for Architect's sandbox.
+- **Guides for Symfony and for Architect's sandbox.** The
+  [Bref guide](docs/bref.md) is out.
 - **Closing the remaining differences from DynamoDB.** The open
   [bug issues](https://github.com/nubo-db/dynoxide/issues?q=is%3Aopen+label%3Abug)
   are each a captured case where Dynoxide answers differently, and they're
